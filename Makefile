@@ -1,4 +1,4 @@
-.PHONY: build up down bash log
+.PHONY: build up down bash log restart
 
 build:
 	docker compose build
@@ -14,3 +14,5 @@ bash:
 
 log:
 	docker compose logs -f
+
+restart: down up

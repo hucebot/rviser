@@ -1,7 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from sensor_msgs.msg import Image, JointState, PointCloud2
+from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import String
 import sensor_msgs_py.point_cloud2 as pc2
 import cv_bridge
@@ -19,6 +19,28 @@ class RviserEmergencyNode(Node):
         self.server = viser.ViserServer()
         self.bridge = cv_bridge.CvBridge()
 
+        # Add a static floor (thin box) to the 3D scene via a small URDF
+        floor_urdf = '''<?xml version="1.0"?>
+        <robot name="floor">
+            <link name="floor_link">
+                <visual>
+                    <origin xyz="0 0 -0.01" rpy="0 0 0"/>
+                    <geometry>
+                        <box size="100 100 0.02"/>
+                    </geometry>
+                    <material name="gray">
+                        <color rgba="0.5 0.5 0.5 1.0"/>
+                    </material>
+                </visual>
+            </link>
+        </robot>
+        '''
+        
+        self.floor_urdf = ViserUrdf(self.server, yourdfpy.URDF.load(io.StringIO(floor_urdf)), root_node_name="/floor")
+        
+        # Example 
+        # self.server.add_icosphere("dionisis")
+
         # UI Handles
         self.img_handle = self.server.gui.add_image(np.zeros((360, 640, 3), dtype=np.uint8), label="Camera")
         self.viser_urdf = None
@@ -30,8 +52,6 @@ class RviserEmergencyNode(Node):
         self.latest_pc = None
         self.pc_lock = False
 
-        # Finished math ready to be rendered
-        self.ready_voxels = None
 
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -40,14 +60,12 @@ class RviserEmergencyNode(Node):
         )
 
         # Subscriptions
-        self.create_subscription(Image, '/orbbec_external/color/image_raw', self.img_cb, sensor_qos)
-        self.create_subscription(PointCloud2, '/orbbec_external/depth_registered/points', self.pc_cb, sensor_qos)
-        self.create_subscription(JointState, 'opensot/joint_states', self.joint_cb, 10)
-        self.create_subscription(String, 'opensot_robot_description', self.urdf_cb,
+        self.create_subscription(Image, '/realsense_head_front/color/image_raw', self.img_cb, sensor_qos)
+        self.create_subscription(JointState, 'joint_states', self.joint_cb, 10)
+        self.create_subscription(String, 'robot_description', self.urdf_cb,
                                  QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
 
         # Separate Math and Render Threads
-        threading.Thread(target=self.voxel_worker, daemon=True).start()
         threading.Thread(target=self.viser_sync_loop, daemon=True).start()
 
     def img_cb(self, msg):
@@ -62,35 +80,6 @@ class RviserEmergencyNode(Node):
         if not self.pc_lock:
             self.latest_pc = msg
 
-    def voxel_worker(self):
-        """Background thread strictly for heavy NumPy crunching."""
-        v_size = 0.08
-        while rclpy.ok():
-            if self.latest_pc:
-                self.pc_lock = True
-                try:
-                    data = pc2.read_points_numpy(self.latest_pc, field_names=("x", "y", "z", "rgb"), skip_nans=True)
-                    if data.shape[0] > 0:
-                        data = data[::5] # Slice downsample
-                        xyz = data[:, :3]
-
-                        keys = np.floor(xyz / v_size).astype(np.int32)
-                        _, idx = np.unique(keys, axis=0, return_index=True)
-
-                        rgb_packed = data[idx, 3].view(np.uint32)
-                        colors = np.stack([
-                            (rgb_packed >> 16) & 0xFF,
-                            (rgb_packed >> 8) & 0xFF,
-                            (rgb_packed) & 0xFF
-                        ], axis=-1).astype(np.uint8)
-
-                        # Store the finished arrays to be picked up by the render loop
-                        self.ready_voxels = (xyz[idx].astype(np.float32), colors)
-                finally:
-                    self.pc_lock = False
-                    self.latest_pc = None
-            time.sleep(0.05)
-
     def viser_sync_loop(self):
         """Single UI thread. Packages everything into one atomic network payload at 30Hz."""
         v_size = 0.08
@@ -103,7 +92,12 @@ class RviserEmergencyNode(Node):
                     try:
                         img = self.bridge.imgmsg_to_cv2(self.latest_img, 'rgb8')
                         self.img_handle.image = cv2.resize(img, (640, 360))
-                    except: pass
+                    except:
+                        # Create an image where it says camera unavailable
+                        img = np.zeros((360, 640, 3), dtype=np.uint8)
+                        cv2.putText(img, "Camera Unavailable", (150, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                        self.img_handle.image = img
+
                     self.latest_img = None
 
                 # 2. Update Robot Joints
@@ -111,14 +105,6 @@ class RviserEmergencyNode(Node):
                     self.viser_urdf.update_cfg(self.latest_joints)
                     self.latest_joints = None
 
-                # 3. Update Voxels
-                if self.ready_voxels is not None:
-                    pts, colors = self.ready_voxels
-                    self.server.scene.add_point_cloud(
-                        "/voxels", points=pts, colors=colors,
-                        point_size=v_size, precision="float16"
-                    )
-                    self.ready_voxels = None
 
             # Instantly push the grouped update to the browser
             self.server.flush()
