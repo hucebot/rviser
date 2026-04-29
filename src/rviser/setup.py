@@ -10,6 +10,7 @@ setup(
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name + '/launch', ['launch/rviser.launch.py']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -18,7 +19,8 @@ setup(
     license='TODO',
     entry_points={
         'console_scripts': [
-            'safe_teleop_node = rviser.safe_teleop_node:main'
+            'safe_teleop_node = rviser.safe_teleop_node:main',
+            'dummy_trajectory_node = rviser.dummy_trajectory_node:main',
         ],
     },
 )
