@@ -62,7 +62,6 @@ class RviserEmergencyNode(Node):
         self.latest_joints = None
 
         self.latest_pc = None
-        self.pc_lock = False
         self.latest_traj = None
         self.traj_handle = None
 
@@ -74,16 +73,16 @@ class RviserEmergencyNode(Node):
         )
 
         # Subscriptions
-        self.create_subscription(Image, '/realsense_head_front/color/image_raw', self.img_cb, sensor_qos)
-        self.create_subscription(JointState, '/opensot/joint_states', self.joint_cb, 10)
-        self.create_subscription(MarkerArray, '/trajectory', self.traj_cb, 10)
+        self.create_subscription(Image, '/realsense_head_front/camera/color/image_raw', self.img_cb, sensor_qos)
+        self.create_subscription(JointState, '/joint_states', self.joint_cb, 10)
+        self.create_subscription(MarkerArray, '/rviser/left/trajectory', self.traj_cb, 10)
         self.create_subscription(String, 'robot_description', self.urdf_cb,
                                  QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
 
         # Separate Math and Render Threads
         # Parameters for first-person view
         self.declare_parameter('first_person', True)
-        self.declare_parameter('first_person_link', 'opensot/head_front_camera_link')
+        self.declare_parameter('first_person_link', 'head_front_camera_link')
         self.declare_parameter('first_person_offset', [0.0, 0.0, 0.0])
         self.declare_parameter('first_person_rotation_x', 0.0)  # degrees
         self.declare_parameter('first_person_rotation_y', 0.0)  # degrees
@@ -154,7 +153,7 @@ class RviserEmergencyNode(Node):
         try:
             # Fetch the transform from base_link to the link
             transform = self.tf_buffer.lookup_transform(
-                'opensot/base_link', link_name, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.1)
+                'base_link', link_name, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.1)
             )
             # Convert ROS transform to 4x4 matrix
             trans = transform.transform.translation
@@ -174,7 +173,6 @@ class RviserEmergencyNode(Node):
             T = np.eye(4, dtype=np.float64)
             T[:3, :3] = rot_matrix
             T[:3, 3] = pos
-            print(T)
             return T
         except (tf2_ros.TransformException, tf2_ros.LookupException, tf2_ros.ExtrapolationException) as e:
             # Silently return None if transform is not available yet
@@ -214,23 +212,24 @@ class RviserEmergencyNode(Node):
                             float(self.first_person_offset[2]),
                         ], dtype=np.float64)
 
-                        cam_pos = link_pose[:3, :3] @ rotated_offset + link_pose[:3, 3]
+                        cam_pos = link_pose[:3, 3]
                         
                         # Apply the local rotation after the link rotation.
-                        composed_rot = link_rot @ local_rot
-                        cam_wxyz = tf.SO3.from_matrix(composed_rot).wxyz
+                        # composed_rot = link_rot @ local_rot
+                        # cam_wxyz = tf.SO3.from_matrix(composed_rot).wxyz
 
                         for client in self.server.get_clients().values():
                             try:
                                 with client.atomic():
                                     client.camera.position = (float(cam_pos[0]), float(cam_pos[1]), float(cam_pos[2]))
                                     camera_position = np.array([float(cam_pos[0]), float(cam_pos[1]), float(cam_pos[2])])
-                                    camera_look_at = composed_rot @ camera_position 
+                                    camera_look_at = link_rot @ camera_position 
                                     client.camera.look_at = (float(camera_look_at[0]), float(camera_look_at[1]), float(camera_look_at[2]))
                                     # client.camera.look_at = (float(cam_pos[0])+10., float(cam_pos[1]), float(cam_pos[2]))
 
                                     # client.camera.wxyz = tuple(float(v) for v in cam_wxyz)
-                            except Exception:
+                            except Exception as e:
+                                print(e)
                                 # ignore per-client failures so rendering continues
                                 pass
                     
