@@ -12,11 +12,13 @@ import sensor_msgs_py.point_cloud2 as pc2
 import cv_bridge
 import numpy as np
 import viser
+import trimesh
 from viser import transforms as tf
 from viser.extras import ViserUrdf
 import yourdfpy
 import io, threading, time, cv2, os
 from ament_index_python.packages import get_package_share_directory
+from pathlib import Path
 
 class RviserEmergencyNode(Node):
     def __init__(self):
@@ -57,13 +59,24 @@ class RviserEmergencyNode(Node):
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
+        # Mesh loading
+        file_path = Path(__file__).resolve()
+        mesh_path = file_path.parents[3] / 'src' / 'rviser' / 'assets' / 'mustard' / 'mustard.obj'
+        
+        self.mesh = trimesh.load_mesh(str(mesh_path))
+        assert isinstance(self.mesh, trimesh.Trimesh), "Expected a single mesh"
+        self.mesh.apply_scale(10.)
+
+        self.vertices = self.mesh.vertices
+        self.faces = self.mesh.faces
+
         # Internal State Buffers
         self.latest_img = None
         self.latest_joints = None
 
-        self.latest_pc = None
         self.latest_traj = None
         self.traj_handle = None
+        self.latest_object_marker = None
 
 
         sensor_qos = QoSProfile(
@@ -72,29 +85,28 @@ class RviserEmergencyNode(Node):
             depth=1
         )
 
-        # Subscriptions
-        self.create_subscription(Image, '/realsense_head_front/camera/color/image_raw', self.img_cb, sensor_qos)
-        self.create_subscription(JointState, '/joint_states', self.joint_cb, 10)
         self.create_subscription(MarkerArray, '/rviser/left/trajectory', self.traj_cb, 10)
+        self.create_subscription(MarkerArray, '/object_marker', self.object_marker_cb, 10)
         self.create_subscription(String, 'robot_description', self.urdf_cb,
                                  QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
 
-        # Separate Math and Render Threads
-        # Parameters for first-person view
         self.declare_parameter('first_person', True)
         self.declare_parameter('first_person_link', 'head_front_camera_link')
-        self.declare_parameter('first_person_offset', [0.0, 0.0, 0.0])
-        self.declare_parameter('first_person_rotation_x', 0.0)  # degrees
-        self.declare_parameter('first_person_rotation_y', 0.0)  # degrees
-        self.declare_parameter('first_person_rotation_z', 0.0)  # degrees
+        self.declare_parameter('show_opensot', False) 
 
-        # Cached parameter values (will be re-read each frame for flexibility)
         self.first_person = self.get_parameter('first_person').value
         self.first_person_link = self.get_parameter('first_person_link').value
-        self.first_person_offset = tuple(self.get_parameter('first_person_offset').value)
-        self.first_person_rotation_x = self.get_parameter('first_person_rotation_x').value
-        self.first_person_rotation_y = self.get_parameter('first_person_rotation_y').value
-        self.first_person_rotation_z = self.get_parameter('first_person_rotation_z').value
+        self._first_person_active_last_frame = self.first_person
+        self.show_opensot = self.get_parameter('show_opensot').value
+
+        # Subscriptions
+        self.create_subscription(Image, '/realsense_head_front/camera/color/image_raw', self.img_cb, sensor_qos)
+
+        if self.show_opensot:
+            self.create_subscription(JointState, '/opensot/joint_states', self.joint_cb, 10)
+        else:
+            self.create_subscription(JointState, '/joint_states', self.joint_cb, 10)
+        
 
         threading.Thread(target=self.viser_sync_loop, daemon=True).start()
 
@@ -118,6 +130,10 @@ class RviserEmergencyNode(Node):
             [[p.x, p.y, p.z] for p in line_marker.points],
             dtype=np.float32,
         )
+
+    def object_marker_cb(self, msg):
+        if msg.markers:
+            self.latest_object_marker = msg.markers[0]
 
     def _rotation_matrix_x(self, angle):
         """Rotation matrix around x-axis."""
@@ -188,50 +204,38 @@ class RviserEmergencyNode(Node):
 
                 self.first_person = bool(self.get_parameter('first_person').value)
                 self.first_person_link = str(self.get_parameter('first_person_link').value)
-                self.first_person_offset = tuple(self.get_parameter('first_person_offset').value)
-                # Convert degrees to radians
-                self.first_person_rotation_x = float(self.get_parameter('first_person_rotation_x').value) * np.pi / 180.0
-                self.first_person_rotation_y = float(self.get_parameter('first_person_rotation_y').value) * np.pi / 180.0
-                self.first_person_rotation_z = float(self.get_parameter('first_person_rotation_z').value) * np.pi / 180.0
 
                 # 1. If first-person view is enabled, set each client's camera to follow
                 if self.first_person:
                     link_pose = self._get_link_world_pose(self.first_person_link)
                     if link_pose is not None:
-                        # Compose the camera pose in the link's local frame so the
-                        # offset and orientation both follow the local camera axes.
                         link_rot = link_pose[:3, :3]
-                        rx_mat = self._rotation_matrix_x(self.first_person_rotation_x)
-                        ry_mat = self._rotation_matrix_y( self.first_person_rotation_y)
-                        rz_mat = self._rotation_matrix_z(self.first_person_rotation_z)
-
-                        local_rot = rz_mat @ ry_mat @ rx_mat
-                        rotated_offset = local_rot @ np.array([
-                            float(self.first_person_offset[0]),
-                            float(self.first_person_offset[1]),
-                            float(self.first_person_offset[2]),
-                        ], dtype=np.float64)
-
-                        cam_pos = link_pose[:3, 3]
-                        
-                        # Apply the local rotation after the link rotation.
-                        # composed_rot = link_rot @ local_rot
-                        # cam_wxyz = tf.SO3.from_matrix(composed_rot).wxyz
-
+                    
                         for client in self.server.get_clients().values():
                             try:
                                 with client.atomic():
-                                    client.camera.position = (float(cam_pos[0]), float(cam_pos[1]), float(cam_pos[2]))
-                                    camera_position = np.array([float(cam_pos[0]), float(cam_pos[1]), float(cam_pos[2])])
-                                    camera_look_at = link_rot @ camera_position 
+                                    client.camera.position = (float(link_pose[0, 3]), float(link_pose[1, 3]), float(link_pose[2, 3]))
+                                    camera_look_at = link_rot @ np.array(client.camera.position) 
                                     client.camera.look_at = (float(camera_look_at[0]), float(camera_look_at[1]), float(camera_look_at[2]))
-                                    # client.camera.look_at = (float(cam_pos[0])+10., float(cam_pos[1]), float(cam_pos[2]))
 
-                                    # client.camera.wxyz = tuple(float(v) for v in cam_wxyz)
                             except Exception as e:
                                 print(e)
                                 # ignore per-client failures so rendering continues
                                 pass
+                elif self._first_person_active_last_frame:
+                    default_position = tuple(float(v) for v in self.server.initial_camera.position)
+                    default_look_at = tuple(float(v) for v in self.server.initial_camera.look_at)
+
+                    for client in self.server.get_clients().values():
+                        try:
+                            with client.atomic():
+                                client.camera.position = default_position
+                                client.camera.look_at = default_look_at
+                        except Exception as e:
+                            print(e)
+                            pass
+
+                self._first_person_active_last_frame = self.first_person
                     
                 # 2. Update Camera Image
                 if self.latest_img:
@@ -266,6 +270,27 @@ class RviserEmergencyNode(Node):
                         line_width=4.0,
                     )
                     self.latest_traj = None
+
+                # 5. Add meshes from object_marker topic
+                if self.latest_object_marker is not None:
+                    marker = self.latest_object_marker
+                    pos = (float(marker.pose.position.x), float(marker.pose.position.y), float(marker.pose.position.z))
+                    quat = marker.pose.orientation
+                    wxyz = (float(quat.w), float(quat.x), float(quat.y), float(quat.z))
+                    self.server.scene.add_mesh_trimesh(
+                        "/trimesh",
+                        mesh=self.mesh,
+                        wxyz=wxyz,
+                        position=pos,
+                    )
+                
+                # For debugging
+                self.server.scene.add_mesh_trimesh(
+                    "/trimesh",
+                    mesh=self.mesh,
+                    wxyz=(1.0, 0.0, 0.0, 0.0),
+                    position=(5.0, 0.0, 1.),
+                )
 
 
             # Instantly push the grouped update to the browser

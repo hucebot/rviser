@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. Install Viser and URDF/Mesh parsing requirements
-RUN pip3 install viser "numpy<2.0.0" yourdfpy pycollada opencv-python open3d
+RUN pip3 install viser "numpy<2.0.0" yourdfpy pycollada opencv-python open3d trimesh
 
 # 3. Setup the workspace and copy your custom node
 WORKDIR /workspace
