@@ -59,16 +59,10 @@ class RviserEmergencyNode(Node):
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        # Mesh loading
-        file_path = Path(__file__).resolve()
-        mesh_path = file_path.parents[3] / 'src' / 'rviser' / 'assets' / 'mustard' / 'mustard.obj'
-        
-        self.mesh = trimesh.load_mesh(str(mesh_path))
-        assert isinstance(self.mesh, trimesh.Trimesh), "Expected a single mesh"
-        self.mesh.apply_scale(10.)
-
-        self.vertices = self.mesh.vertices
-        self.faces = self.mesh.faces
+        # Mesh loading - cache for dynamic loading
+        self.file_path = Path(__file__).resolve()
+        self.mesh_cache = {}  # Dictionary to cache loaded meshes
+        self.mesh_scale = 10.  # Default scale for meshes
 
         # Internal State Buffers
         self.latest_img = None
@@ -77,6 +71,7 @@ class RviserEmergencyNode(Node):
         self.latest_traj = None
         self.traj_handle = None
         self.latest_object_marker = None
+        self.latest_mesh_resource = None
 
 
         sensor_qos = QoSProfile(
@@ -90,7 +85,7 @@ class RviserEmergencyNode(Node):
         self.create_subscription(String, 'robot_description', self.urdf_cb,
                                  QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
 
-        self.declare_parameter('first_person', True)
+        self.declare_parameter('first_person', False)
         self.declare_parameter('first_person_link', 'head_front_camera_link')
         self.declare_parameter('show_opensot', False) 
 
@@ -102,10 +97,8 @@ class RviserEmergencyNode(Node):
         # Subscriptions
         self.create_subscription(Image, '/realsense_head_front/camera/color/image_raw', self.img_cb, sensor_qos)
 
-        if self.show_opensot:
-            self.create_subscription(JointState, '/opensot/joint_states', self.joint_cb, 10)
-        else:
-            self.create_subscription(JointState, '/joint_states', self.joint_cb, 10)
+        self.create_subscription(JointState, '/opensot/joint_states', self.opensot_joint_cb, 10)
+        self.create_subscription(JointState, '/joint_states', self.joint_cb, 10)
         
 
         threading.Thread(target=self.viser_sync_loop, daemon=True).start()
@@ -114,7 +107,12 @@ class RviserEmergencyNode(Node):
         self.latest_img = msg
 
     def joint_cb(self, msg):
-        if self.viser_urdf:
+        if self.viser_urdf and not self.show_opensot: 
+            joint_map = dict(zip(msg.name, msg.position))
+            self.latest_joints = np.array([joint_map.get(name, 0.0) for name in self.viser_urdf.get_actuated_joint_limits().keys()])
+
+    def opensot_joint_cb(self, msg):
+        if self.viser_urdf and self.show_opensot:
             joint_map = dict(zip(msg.name, msg.position))
             self.latest_joints = np.array([joint_map.get(name, 0.0) for name in self.viser_urdf.get_actuated_joint_limits().keys()])
 
@@ -134,7 +132,37 @@ class RviserEmergencyNode(Node):
     def object_marker_cb(self, msg):
         if msg.markers:
             self.latest_object_marker = msg.markers[0]
+            self.latest_mesh_resource = msg.markers[0].mesh_resource
 
+    def _load_mesh_from_resource(self, mesh_resource):
+        """Load a mesh from a resource path like 'file:///mesh_assets/milk/milk.obj'.
+        Caches meshes to avoid reloading.
+        Returns a trimesh.Trimesh object or None if loading fails.
+        """
+        if mesh_resource in self.mesh_cache:
+            return self.mesh_cache[mesh_resource]
+        
+        # Parse the resource path
+        # Example: file:///mesh_assets/milk/milk.obj -> mesh_assets/milk/milk.obj        
+        relative_path = mesh_resource[7:]  # Remove 'file://'
+        
+        # Construct full path
+        mesh_path = self.file_path.parents[1] / relative_path
+        
+        if not mesh_path.exists():
+            self.get_logger().warn(f"Mesh file not found: {mesh_path}")
+            return None
+        
+        # Load the mesh
+        mesh = trimesh.load_mesh(str(mesh_path))
+        
+        # Apply scale
+        mesh.apply_scale(self.mesh_scale)
+        
+        # Cache it
+        self.mesh_cache[mesh_resource] = mesh
+        return mesh
+    
     def _rotation_matrix_x(self, angle):
         """Rotation matrix around x-axis."""
         c, s = np.cos(angle), np.sin(angle)
@@ -257,40 +285,67 @@ class RviserEmergencyNode(Node):
                 # 4. Update trajectory visualization from MarkerArray.
                 if self.latest_traj is not None and self.latest_traj.shape[0] >= 2:
                     points = self.latest_traj
-                    segments = np.stack((points[:-1], points[1:]), axis=1)
                     colors = np.array([30, 170, 255], dtype=np.uint8)
 
+                    # Tranform points for any frame to base_link frame
+                    header_frame = 'base_link'  
+
+                    # Convert ROS transform to 4x4 matrix and apply to points
+                    transform_matrix = np.eye(4)
+                    points_transformed = points
+                    if header_frame != 'base_link':
+                        try:
+                            # Build a homogeneous transformation matrix from header_frame to base_link
+                            transform = self.tf_buffer.lookup_transform(
+                                'base_link', header_frame, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.1)
+                            )
+                            trans = transform.transform.translation
+                            rot = transform.transform.rotation
+                            pos = np.array([trans.x, trans.y, trans.z])     
+                            quat = np.array([rot.x, rot.y, rot.z, rot.w])
+                            x, y, z, w = quat
+                            rot_matrix = np.array([
+                                [1 - 2*(y*y + z*z),     2*(x*y - z*w),     2*(x*z + y*w)],
+                                [    2*(x*y + z*w), 1 - 2*(x*x + z*z),     2*(y*z - x*w)],
+                                [    2*(x*z - y*w),     2*(y*z + x*w), 1 - 2*(x*x + y*y)],
+                            ], dtype=np.float64)
+                            transform_matrix[:3, :3] = rot_matrix
+                            transform_matrix[:3, 3] = pos   
+                            # Apply the transformation to the points
+                            points_homogeneous = np.hstack([points, np.ones((points.shape[0], 1))])  # Convert to homogeneous coordinates
+                            points_transformed = (transform_matrix @ points_homogeneous.T).T[:, :3]  # Transform and convert back to 3D
+                        except Exception as e:
+                            self.get_logger().warn(f"TF lookup failed: {e}")
+                            points_transformed = points 
+                    
                     if self.traj_handle is not None:
                         self.traj_handle.remove()
 
                     self.traj_handle = self.server.scene.add_line_segments(
                         "/trajectory/path",
-                        points=segments,
+                        points=points_transformed,
                         colors=colors,
                         line_width=4.0,
                     )
                     self.latest_traj = None
 
                 # 5. Add meshes from object_marker topic
-                if self.latest_object_marker is not None:
+                if self.latest_object_marker is not None and self.latest_mesh_resource is not None:
                     marker = self.latest_object_marker
-                    pos = (float(marker.pose.position.x), float(marker.pose.position.y), float(marker.pose.position.z))
-                    quat = marker.pose.orientation
-                    wxyz = (float(quat.w), float(quat.x), float(quat.y), float(quat.z))
-                    self.server.scene.add_mesh_trimesh(
-                        "/trimesh",
-                        mesh=self.mesh,
-                        wxyz=wxyz,
-                        position=pos,
-                    )
-                
-                # For debugging
-                self.server.scene.add_mesh_trimesh(
-                    "/trimesh",
-                    mesh=self.mesh,
-                    wxyz=(1.0, 0.0, 0.0, 0.0),
-                    position=(5.0, 0.0, 1.),
-                )
+                    
+                    # Load the mesh from the resource path
+                    mesh = self._load_mesh_from_resource(self.latest_mesh_resource)
+                    
+                    if mesh is not None:
+                        pos = (float(marker.pose.position.x), float(marker.pose.position.y), float(marker.pose.position.z))
+                        quat = marker.pose.orientation
+                        wxyz = (float(quat.w), float(quat.x), float(quat.y), float(quat.z))
+                        self.server.scene.add_mesh_trimesh(
+                            "/trimesh",
+                            mesh=mesh,
+                            wxyz=wxyz,
+                            position=pos,
+                        )
 
 
             # Instantly push the grouped update to the browser
