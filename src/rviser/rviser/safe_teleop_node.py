@@ -47,6 +47,11 @@ class RviserEmergencyNode(Node):
         
         self.floor_urdf = ViserUrdf(self.server, yourdfpy.URDF.load(io.StringIO(floor_urdf)), root_node_name="/floor")
         
+        # --- FIX 1: Create a distinct Root Frame for the Robot ---
+        # Everything attached to "/robot" will move when this frame moves.
+        self.robot_frame = self.server.scene.add_frame("/robot")
+        # ---------------------------------------------------------
+
         # Set the initial camera pose. This is the pose that new clients will start at,
         # and also what "Reset View" will return to.
         self.server.initial_camera.position = (2.0, 1.0, 1.5)
@@ -71,7 +76,6 @@ class RviserEmergencyNode(Node):
 
         self.latest_traj = {"left": None, "right": None}
         self.latest_traj_frame = {"left": "gripper_left_grasping_link", "right": "gripper_right_grasping_link"}
-        # self.latest_traj_frame = {"left": "base_link", "right": "base_link"}
         self.traj_handles = {"left": None, "right": None}
         self.latest_object_marker = None
         self.latest_mesh_resource = None
@@ -101,7 +105,6 @@ class RviserEmergencyNode(Node):
 
         # Subscriptions
         self.create_subscription(Image, '/rgbd/realsense_head_front/color/image_raw', self.img_cb, sensor_qos)
-
         self.create_subscription(JointState, '/opensot/joint_states', self.opensot_joint_cb, 10)
         self.create_subscription(JointState, '/joint_states', self.joint_cb, 10)
         
@@ -155,77 +158,31 @@ class RviserEmergencyNode(Node):
         self.latest_robot_pose = msg
 
     def _load_mesh_from_resource(self, mesh_resource):
-        """Load a mesh from a resource path like 'file:///mesh_assets/milk/milk.obj'.
-        Caches meshes to avoid reloading.
-        Returns a trimesh.Trimesh object or None if loading fails.
-        """
         if mesh_resource in self.mesh_cache:
             return self.mesh_cache[mesh_resource]
-        
-        # Parse the resource path
-        # Example: file:///mesh_assets/milk/milk.obj -> mesh_assets/milk/milk.obj        
+             
         relative_path = mesh_resource[7:]  # Remove 'file://'
-        
-        # Construct full path
         mesh_path = self.file_path.parents[1] / relative_path
         
         if not mesh_path.exists():
             self.get_logger().warn(f"Mesh file not found: {mesh_path}")
             return None
         
-        # Load the mesh
         mesh = trimesh.load_mesh(str(mesh_path))
-        
-        # Apply scale
         mesh.apply_scale(self.mesh_scale)
-        
-        # Cache it
         self.mesh_cache[mesh_resource] = mesh
         return mesh
-    
-    def _rotation_matrix_x(self, angle):
-        """Rotation matrix around x-axis."""
-        c, s = np.cos(angle), np.sin(angle)
-        return np.array([
-            [1,  0,  0],
-            [0,  c, -s],
-            [0,  s,  c],
-        ], dtype=np.float64)
-
-    def _rotation_matrix_y(self, angle):
-        """Rotation matrix around y-axis."""
-        c, s = np.cos(angle), np.sin(angle)
-        return np.array([
-            [ c,  0,  s],
-            [ 0,  1,  0],
-            [-s,  0,  c],
-        ], dtype=np.float64)
-
-    def _rotation_matrix_z(self, angle):
-        """Rotation matrix around z-axis."""
-        c, s = np.cos(angle), np.sin(angle)
-        return np.array([
-            [c, -s,  0],
-            [s,  c,  0],
-            [0,  0,  1],
-        ], dtype=np.float64)
 
     def _get_link_world_pose(self, link_name):
-        """Get a link pose from the ROS /tf topic.
-        Returns a 4x4 homogeneous transform or None if unavailable.
-        """
         try:
-            # Fetch the transform from base_link to the link
             transform = self.tf_buffer.lookup_transform(
                 'base_link', link_name, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.1)
             )
-            # Convert ROS transform to 4x4 matrix
             trans = transform.transform.translation
             rot = transform.transform.rotation
             pos = np.array([trans.x, trans.y, trans.z])
             quat = np.array([rot.x, rot.y, rot.z, rot.w])
             
-            # Convert quaternion (x, y, z, w) to rotation matrix
             x, y, z, w = quat
             rot_matrix = np.array([
                 [1 - 2*(y*y + z*z),     2*(x*y - z*w),     2*(x*z + y*w)],
@@ -233,41 +190,33 @@ class RviserEmergencyNode(Node):
                 [    2*(x*z - y*w),     2*(y*z + x*w), 1 - 2*(x*x + y*y)],
             ], dtype=np.float64)
             
-            # Build 4x4 homogeneous transform
             T = np.eye(4, dtype=np.float64)
             T[:3, :3] = rot_matrix
             T[:3, 3] = pos
             return T
         except (tf2_ros.TransformException, tf2_ros.LookupException, tf2_ros.ExtrapolationException) as e:
-            # Silently return None if transform is not available yet
             print(e)
             return None
 
-
     def viser_sync_loop(self):
-        """Single UI thread. Packages everything into one atomic network payload at 30Hz."""
         while rclpy.ok():
-            # Open the atomic grouping context
             with self.server.atomic():
 
                 self.first_person = bool(self.get_parameter('first_person').value)
 
-                # 1. If first-person view is enabled, set each client's camera to follow
+                # 1. First-person view
                 if self.first_person:
                     link_pose = self._get_link_world_pose(self.first_person_link)
                     if link_pose is not None:
                         link_rot = link_pose[:3, :3]
-                    
                         for client in self.server.get_clients().values():
                             try:
                                 with client.atomic():
                                     client.camera.position = (float(link_pose[0, 3]), float(link_pose[1, 3]), float(link_pose[2, 3]))
                                     camera_look_at = link_rot @ np.array(client.camera.position) 
                                     client.camera.look_at = (float(camera_look_at[0]), float(camera_look_at[1]), float(camera_look_at[2]))
-
                             except Exception as e:
                                 print(e)
-                                # ignore per-client failures so rendering continues
                                 pass
                 elif self._first_person_active_last_frame:
                     default_position = tuple(float(v) for v in self.server.initial_camera.position)
@@ -293,7 +242,6 @@ class RviserEmergencyNode(Node):
                         img = np.zeros((360, 640, 3), dtype=np.uint8)
                         cv2.putText(img, "Camera Unavailable", (150, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
                         self.img_handle.image = img
-
                     self.latest_img = None
 
                 # 3. Update Robot Joints
@@ -301,18 +249,17 @@ class RviserEmergencyNode(Node):
                     self.viser_urdf.update_cfg(self.latest_joints)
                     self.latest_joints = None
 
-                # 3.5. Update Robot Base Pose
+                # --- FIX 2: Apply pose to the 'robot_frame', not the ViserUrdf helper! ---
                 if self.latest_robot_pose is not None and self.viser_urdf is not None:
                     pose = self.latest_robot_pose.pose
                     pos = pose.position
                     quat = pose.orientation
-                    # Convert to wxyz format (w, x, y, z) for viser
-                    wxyz = (float(quat.w), float(quat.x), float(quat.y), float(quat.z))
-                    position = (float(pos.x), float(pos.y), float(pos.z))
-                    self.viser_urdf.position = position
-                    self.viser_urdf.wxyz = wxyz
+                    
+                    self.robot_frame.position = (float(pos.x), float(pos.y), float(pos.z))
+                    self.robot_frame.wxyz = (float(quat.w), float(quat.x), float(quat.y), float(quat.z))
+                # -------------------------------------------------------------------------
 
-                # 4. Update trajectory visualization from MarkerArray.
+                # 4. Update trajectory visualization
                 trajectory_specs = {
                     "left": (np.array([30, 170, 255], dtype=np.uint8), "/trajectory/left"),
                     "right": (np.array([255, 120, 30], dtype=np.uint8), "/trajectory/right"),
@@ -332,7 +279,6 @@ class RviserEmergencyNode(Node):
                     if points.shape[0] < 2:
                         continue
 
-                    # Convert ROS transform to 4x4 matrix and apply to points
                     transform_matrix = np.eye(4)
                     points_transformed = points
                     if header_frame != 'base_link':
@@ -375,10 +321,7 @@ class RviserEmergencyNode(Node):
                 # 5. Add meshes from object_marker topic
                 if self.latest_object_marker is not None and self.latest_mesh_resource is not None:
                     marker = self.latest_object_marker
-                    
-                    # Load the mesh from the resource path
                     mesh = self._load_mesh_from_resource(self.latest_mesh_resource)
-                    
                     if mesh is not None:
                         pos = (float(marker.pose.position.x), float(marker.pose.position.y), float(marker.pose.position.z))
                         quat = marker.pose.orientation
@@ -390,10 +333,8 @@ class RviserEmergencyNode(Node):
                             position=pos,
                         )
 
-
-            # Instantly push the grouped update to the browser
             self.server.flush()
-            time.sleep(0.033) # Lock to ~30 FPS
+            time.sleep(0.033) 
 
     def urdf_cb(self, msg):
         if self.viser_urdf: return
@@ -402,7 +343,14 @@ class RviserEmergencyNode(Node):
                 p = fname.split('/')
                 return os.path.join(get_package_share_directory(p[2]), '/'.join(p[3:]))
             return fname
-        self.viser_urdf = ViserUrdf(self.server, yourdfpy.URDF.load(io.StringIO(msg.data), filename_handler=resolver), root_node_name="/opensot")
+        
+        # --- FIX 3: Load the URDF directly beneath the movable robot_frame ---
+        self.viser_urdf = ViserUrdf(
+            self.server, 
+            yourdfpy.URDF.load(io.StringIO(msg.data), filename_handler=resolver), 
+            root_node_name="/robot/urdf" 
+        )
+        # ---------------------------------------------------------------------
 
 def main():
     rclpy.init()
