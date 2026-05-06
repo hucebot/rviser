@@ -6,6 +6,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import String
 from visualization_msgs.msg import MarkerArray
+from geometry_msgs.msg import PoseStamped
 import tf2_ros
 from geometry_msgs.msg import TransformStamped
 import sensor_msgs_py.point_cloud2 as pc2
@@ -68,10 +69,13 @@ class RviserEmergencyNode(Node):
         self.latest_img = None
         self.latest_joints = None
 
-        self.latest_traj = None
-        self.traj_handle = None
+        self.latest_traj = {"left": None, "right": None}
+        self.latest_traj_frame = {"left": "gripper_left_grasping_link", "right": "gripper_right_grasping_link"}
+        # self.latest_traj_frame = {"left": "base_link", "right": "base_link"}
+        self.traj_handles = {"left": None, "right": None}
         self.latest_object_marker = None
         self.latest_mesh_resource = None
+        self.latest_robot_pose = None
 
 
         sensor_qos = QoSProfile(
@@ -80,22 +84,23 @@ class RviserEmergencyNode(Node):
             depth=1
         )
 
-        self.create_subscription(MarkerArray, '/rviser/left/trajectory', self.traj_cb, 10)
+        self.create_subscription(MarkerArray, '/rviser/left/trajectory', self.left_traj_cb, 10)
+        self.create_subscription(MarkerArray, '/rviser/right/trajectory', self.right_traj_cb, 10)
         self.create_subscription(MarkerArray, '/object_marker', self.object_marker_cb, 10)
+        self.create_subscription(PoseStamped, '/robot_pose', self.robot_pose_cb, 10)
         self.create_subscription(String, 'robot_description', self.urdf_cb,
                                  QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
 
         self.declare_parameter('first_person', False)
-        self.declare_parameter('first_person_link', 'head_front_camera_link')
         self.declare_parameter('show_opensot', False) 
 
         self.first_person = self.get_parameter('first_person').value
-        self.first_person_link = self.get_parameter('first_person_link').value
+        self.first_person_link = 'head_front_camera_link'
         self._first_person_active_last_frame = self.first_person
         self.show_opensot = self.get_parameter('show_opensot').value
 
         # Subscriptions
-        self.create_subscription(Image, '/realsense_head_front/camera/color/image_raw', self.img_cb, sensor_qos)
+        self.create_subscription(Image, '/rgbd/realsense_head_front/color/image_raw', self.img_cb, sensor_qos)
 
         self.create_subscription(JointState, '/opensot/joint_states', self.opensot_joint_cb, 10)
         self.create_subscription(JointState, '/joint_states', self.joint_cb, 10)
@@ -116,23 +121,38 @@ class RviserEmergencyNode(Node):
             joint_map = dict(zip(msg.name, msg.position))
             self.latest_joints = np.array([joint_map.get(name, 0.0) for name in self.viser_urdf.get_actuated_joint_limits().keys()])
 
-    def traj_cb(self, msg):
+    def left_traj_cb(self, msg):
+        self.traj_cb(msg, "left")
+
+    def right_traj_cb(self, msg):
+        self.traj_cb(msg, "right")
+
+    def traj_cb(self, msg, side):
         if not msg.markers:
+            self.latest_traj[side] = None
+            self.latest_traj_frame[side] = None
             return
 
         line_marker = msg.markers[0]
         if not line_marker.points:
+            self.latest_traj[side] = None
+            self.latest_traj_frame[side] = None
             return
 
-        self.latest_traj = np.array(
+        self.latest_traj[side] = np.array(
             [[p.x, p.y, p.z] for p in line_marker.points],
             dtype=np.float32,
         )
+        self.latest_traj_frame[side] = line_marker.header.frame_id
 
     def object_marker_cb(self, msg):
         if msg.markers:
             self.latest_object_marker = msg.markers[0]
             self.latest_mesh_resource = msg.markers[0].mesh_resource
+
+    def robot_pose_cb(self, msg):
+        """Handle robot pose updates and move the robot in viser."""
+        self.latest_robot_pose = msg
 
     def _load_mesh_from_resource(self, mesh_resource):
         """Load a mesh from a resource path like 'file:///mesh_assets/milk/milk.obj'.
@@ -231,7 +251,6 @@ class RviserEmergencyNode(Node):
             with self.server.atomic():
 
                 self.first_person = bool(self.get_parameter('first_person').value)
-                self.first_person_link = str(self.get_parameter('first_person_link').value)
 
                 # 1. If first-person view is enabled, set each client's camera to follow
                 if self.first_person:
@@ -282,20 +301,42 @@ class RviserEmergencyNode(Node):
                     self.viser_urdf.update_cfg(self.latest_joints)
                     self.latest_joints = None
 
-                # 4. Update trajectory visualization from MarkerArray.
-                if self.latest_traj is not None and self.latest_traj.shape[0] >= 2:
-                    points = self.latest_traj
-                    colors = np.array([30, 170, 255], dtype=np.uint8)
+                # 3.5. Update Robot Base Pose
+                if self.latest_robot_pose is not None and self.viser_urdf is not None:
+                    pose = self.latest_robot_pose.pose
+                    pos = pose.position
+                    quat = pose.orientation
+                    # Convert to wxyz format (w, x, y, z) for viser
+                    wxyz = (float(quat.w), float(quat.x), float(quat.y), float(quat.z))
+                    position = (float(pos.x), float(pos.y), float(pos.z))
+                    self.viser_urdf.position = position
+                    self.viser_urdf.wxyz = wxyz
 
-                    # Tranform points for any frame to base_link frame
-                    header_frame = 'base_link'  
+                # 4. Update trajectory visualization from MarkerArray.
+                trajectory_specs = {
+                    "left": (np.array([30, 170, 255], dtype=np.uint8), "/trajectory/left"),
+                    "right": (np.array([255, 120, 30], dtype=np.uint8), "/trajectory/right"),
+                }
+
+                for side, (colors, scene_path) in trajectory_specs.items():
+                    points = self.latest_traj[side]
+                    header_frame = self.latest_traj_frame[side]
+                    handle = self.traj_handles[side]
+
+                    if points is None or header_frame is None:
+                        if handle is not None:
+                            handle.remove()
+                            self.traj_handles[side] = None
+                        continue
+
+                    if points.shape[0] < 2:
+                        continue
 
                     # Convert ROS transform to 4x4 matrix and apply to points
                     transform_matrix = np.eye(4)
                     points_transformed = points
                     if header_frame != 'base_link':
                         try:
-                            # Build a homogeneous transformation matrix from header_frame to base_link
                             transform = self.tf_buffer.lookup_transform(
                                 'base_link', header_frame, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.1)
                             )
@@ -310,24 +351,26 @@ class RviserEmergencyNode(Node):
                                 [    2*(x*z - y*w),     2*(y*z + x*w), 1 - 2*(x*x + y*y)],
                             ], dtype=np.float64)
                             transform_matrix[:3, :3] = rot_matrix
-                            transform_matrix[:3, 3] = pos   
-                            # Apply the transformation to the points
-                            points_homogeneous = np.hstack([points, np.ones((points.shape[0], 1))])  # Convert to homogeneous coordinates
-                            points_transformed = (transform_matrix @ points_homogeneous.T).T[:, :3]  # Transform and convert back to 3D
+                            transform_matrix[:3, 3] = pos
+                            points_homogeneous = np.hstack([points, np.ones((points.shape[0], 1))])
+                            points_transformed = (transform_matrix @ points_homogeneous.T).T[:, :3]
                         except Exception as e:
-                            self.get_logger().warn(f"TF lookup failed: {e}")
-                            points_transformed = points 
-                    
-                    if self.traj_handle is not None:
-                        self.traj_handle.remove()
+                            self.get_logger().warn(f"TF lookup failed for {side}: {e}")
+                            points_transformed = points
 
-                    self.traj_handle = self.server.scene.add_line_segments(
-                        "/trajectory/path",
-                        points=points_transformed,
+                    if handle is not None:
+                        handle.remove()
+
+                    segment_points = np.stack([points_transformed[:-1], points_transformed[1:]], axis=1)
+
+                    self.traj_handles[side] = self.server.scene.add_line_segments(
+                        scene_path,
+                        points=segment_points,
                         colors=colors,
                         line_width=4.0,
                     )
-                    self.latest_traj = None
+                    self.latest_traj[side] = None
+                    self.latest_traj_frame[side] = None
 
                 # 5. Add meshes from object_marker topic
                 if self.latest_object_marker is not None and self.latest_mesh_resource is not None:
