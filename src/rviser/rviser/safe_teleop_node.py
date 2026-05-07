@@ -173,7 +173,7 @@ class RviserEmergencyNode(Node):
         self.mesh_cache[mesh_resource] = mesh
         return mesh
 
-    def _get_link_world_pose(self, link_name):
+    def _get_base_pose_link(self, link_name):
         try:
             transform = self.tf_buffer.lookup_transform(
                 'base_link', link_name, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.1)
@@ -198,6 +198,19 @@ class RviserEmergencyNode(Node):
             print(e)
             return None
 
+    def _pose_matrix(self, position, wxyz):
+        w, x, y, z = wxyz
+        rotation_matrix = np.array([
+            [1 - 2 * (y * y + z * z),     2 * (x * y - z * w),     2 * (x * z + y * w)],
+            [    2 * (x * y + z * w), 1 - 2 * (x * x + z * z),     2 * (y * z - x * w)],
+            [    2 * (x * z - y * w),     2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ], dtype=np.float64)
+
+        transform = np.eye(4, dtype=np.float64)
+        transform[:3, :3] = rotation_matrix
+        transform[:3, 3] = np.array(position, dtype=np.float64)
+        return transform
+
     def viser_sync_loop(self):
         while rclpy.ok():
             with self.server.atomic():
@@ -206,14 +219,18 @@ class RviserEmergencyNode(Node):
 
                 # 1. First-person view
                 if self.first_person:
-                    link_pose = self._get_link_world_pose(self.first_person_link)
+                    link_pose = self._get_base_pose_link(self.first_person_link)
                     if link_pose is not None:
-                        link_rot = link_pose[:3, :3]
+                        robot_pose = self._pose_matrix(self.robot_frame.position, self.robot_frame.wxyz)
+                        world_pose = robot_pose @ link_pose
+                        world_position = world_pose[:3, 3]
+                        world_rotation = world_pose[:3, :3]
+                        camera_forward = world_rotation @ np.array([1.0, 0.0, 0.0], dtype=np.float64)
                         for client in self.server.get_clients().values():
                             try:
                                 with client.atomic():
-                                    client.camera.position = (float(link_pose[0, 3]), float(link_pose[1, 3]), float(link_pose[2, 3]))
-                                    camera_look_at = link_rot @ np.array(client.camera.position) 
+                                    client.camera.position = (float(world_position[0]), float(world_position[1]), float(world_position[2]))
+                                    camera_look_at = world_position + world_rotation @ np.array([1.0, 0.0, 0.0], dtype=np.float64) 
                                     client.camera.look_at = (float(camera_look_at[0]), float(camera_look_at[1]), float(camera_look_at[2]))
                             except Exception as e:
                                 print(e)
