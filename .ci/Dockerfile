@@ -9,12 +9,8 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. Install Viser and URDF/Mesh parsing requirements
-RUN pip3 install viser "numpy<2.0.0" yourdfpy pycollada opencv-python open3d trimesh
+RUN pip3 install viser "numpy<2.0.0" yourdfpy pycollada opencv-python open3d trimesh 
 
-# 3. Setup the workspace and copy your custom node
-WORKDIR /workspace
-COPY src/ /workspace/src/
-COPY . /workspace/src/rviser/
 
 # 4. Clone all the TIAGo / PAL Robotics description packages
 WORKDIR /workspace/src
@@ -44,6 +40,12 @@ RUN apt-get update && \
 
 # Compile everything (your node + TIAGo descriptions) so ROS indexes the mesh paths
 RUN /bin/bash -c "source /opt/ros/humble/setup.bash && colcon build"
+
+# 3. Setup the workspace and copy your custom node
+WORKDIR /workspace
+COPY src/ /workspace/src/
+COPY . /workspace/src/rviser/
+
 
 # 6. Setup Entrypoint
 COPY .ci/entrypoint.sh /
