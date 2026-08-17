@@ -80,7 +80,7 @@ class RviserEmergencyNode(Node):
         self.latest_robot_pose = None
 
         # Parameters
-        self.declare_parameter('first_person', False)
+        self.declare_parameter('first_person', True)
         self.declare_parameter('show_opensot', False)
         self.declare_parameter('camera_topic', '/camera/image_raw')
         self.declare_parameter('joint_topic', '/joint_states')
@@ -261,7 +261,7 @@ class RviserEmergencyNode(Node):
                                 with client.atomic():
                                     client.camera.position = (float(world_position[0]), float(world_position[1]), float(world_position[2]))
                                     camera_look_at = world_position + world_rotation @ np.array([1.0, 0.0, 0.0], dtype=np.float64) 
-                                    client.camera.look_at = (float(camera_look_at[0]), float(camera_look_at[1]), float(camera_look_at[2]))
+                                    client.camera.look_at = (float(camera_look_at[0]) + 0.5, float(camera_look_at[1]), float(camera_look_at[2]))
                             except Exception:
                                 pass
                 elif self._first_person_active_last_frame:
