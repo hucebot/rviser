@@ -8,14 +8,20 @@
       <MaxMessageSize>1400B</MaxMessageSize>
 
       <!-- Explicitly allow/control multicast -->
-      <AllowMulticast>true</AllowMulticast>
+      <AllowMulticast>false</AllowMulticast>
 
       <!-- Optional: Change the multicast group if you have collisions -->
     </General>
     <Discovery>
       <!-- Force discovery to use multicast -->
       <ParticipantIndex>auto</ParticipantIndex>
-      <MaxAutoParticipantIndex>500</MaxAutoParticipantIndex>
+      <Peers>
+          <Peer Address="10.68.0.1"/>
+          <Peer Address="10.68.0.42"/>
+          <Peer Address="10.68.0.210"/>
+          <Peer Address="localhost"/>
+      </Peers>
+      <MaxAutoParticipantIndex>99</MaxAutoParticipantIndex>
     </Discovery>
   </Domain>
 </CycloneDDS>

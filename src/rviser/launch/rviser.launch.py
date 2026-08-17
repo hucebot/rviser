@@ -3,6 +3,23 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description() -> LaunchDescription:
+    # Republish compressed RealSense color images as raw images for subscribers.
+    image_decompressor = Node(
+        package="image_transport",
+        executable="republish",
+        name="head_front_color_decompressor",
+        output="screen",
+        arguments=[
+            "compressed",
+            "raw",
+            "--ros-args",
+            "-r",
+            "in/compressed:=/rgbd/realsense_head_front/color/image_raw/compressed",
+            "-r",
+            "out:=/rgbd/realsense_head_front/color/image_raw",
+        ],
+    )
+
     safe_teleop_node = Node(
         package="rviser",
         executable="safe_teleop_node",
@@ -18,6 +35,7 @@ def generate_launch_description() -> LaunchDescription:
     )
 
     return LaunchDescription([
+        image_decompressor,
         safe_teleop_node,
         dummy_trajectory_node,
     ])

@@ -4,6 +4,7 @@ FROM ros:humble-ros-base
 RUN apt-get update && apt-get install -y \
     python3-pip \
     ros-humble-cv-bridge \
+    ros-humble-image-transport-plugins \
     ros-humble-rmw-cyclonedds-cpp \
     git \
     && rm -rf /var/lib/apt/lists/*
