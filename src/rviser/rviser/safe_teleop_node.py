@@ -82,7 +82,7 @@ class RviserEmergencyNode(Node):
         # Parameters
         self.declare_parameter('first_person', False)
         self.declare_parameter('show_opensot', False)
-        self.declare_parameter('camera_topic', '/rgbd/realsense_head_front/color/image_raw')
+        self.declare_parameter('camera_topic', '/camera/image_raw')
         self.declare_parameter('joint_topic', '/joint_states')
         self.declare_parameter('opensot_topic', '/opensot/joint_states')
 
