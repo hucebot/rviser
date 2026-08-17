@@ -3,7 +3,7 @@
         <General>
             <!-- Define which network interface to use -->
             <Interfaces>
-                <NetworkInterface name="enp0s31f6" priority="2" presence_required="true" />
+                <NetworkInterface name="enxc0470e98212b" priority="2" presence_required="true" />
                 <!-- <NetworkInterface name="br0" priority="1" presence_required="false" /> -->
             </Interfaces>
 

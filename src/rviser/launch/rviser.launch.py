@@ -16,7 +16,7 @@ def generate_launch_description() -> LaunchDescription:
             "-r",
             "in/compressed:=/rgbd/realsense_head_front/color/image_raw/compressed",
             "-r",
-            "out:=/rgbd/realsense_head_front/color/image_raw",
+            "out:=/camera/image_raw",
         ],
     )
 
