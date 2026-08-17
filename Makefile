@@ -1,7 +1,7 @@
 .PHONY: build up down bash log restart
 
 build:
-	docker compose build
+	docker compose build 
 
 up:
 	docker compose up -d

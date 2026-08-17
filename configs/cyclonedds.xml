@@ -1,11 +1,11 @@
-  <CycloneDDS>
-  <Domain>
-    <General>
-      <!-- Define which network interface to use -->
-      <Interfaces>
-        <NetworkInterface name="enxc0470e98212b" priority="1" />
-      </Interfaces>
-      <MaxMessageSize>1400B</MaxMessageSize>
+<CycloneDDS>
+    <Domain>
+        <General>
+            <!-- Define which network interface to use -->
+            <Interfaces>
+                <NetworkInterface name="enp0s31f6" priority="2" presence_required="true" />
+                <!-- <NetworkInterface name="br0" priority="1" presence_required="false" /> -->
+            </Interfaces>
 
       <!-- Explicitly allow/control multicast -->
       <AllowMulticast>false</AllowMulticast>
