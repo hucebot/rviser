@@ -65,7 +65,7 @@ class RviserEmergencyNode(Node):
 
         self.file_path = Path(__file__).resolve()
         self.mesh_cache = {}  
-        self.mesh_scale = 10.
+        self.mesh_scale = 1.
 
         # Internal State Buffers
         self.latest_img = None
@@ -75,12 +75,13 @@ class RviserEmergencyNode(Node):
         self.latest_traj_frame = {"left": "gripper_left_grasping_link", "right": "gripper_right_grasping_link"}
         self.traj_dirty = {"left": False, "right": False}
         self.traj_handles = {"left": None, "right": None}
+        self.marker_mesh_handles = {}  # scene_path -> (handle, mesh_resource)
         
         self.latest_object_marker = None
         self.latest_robot_pose = None
 
         # Parameters
-        self.declare_parameter('first_person', True)
+        self.declare_parameter('first_person', False)
         self.declare_parameter('show_opensot', False)
         self.declare_parameter('camera_topic', '/camera/image_raw')
         self.declare_parameter('joint_topic', '/joint_states')
@@ -102,7 +103,7 @@ class RviserEmergencyNode(Node):
         # Subscriptions
         self.create_subscription(MarkerArray, '/rviser/left/trajectory', self.left_traj_cb, 10)
         self.create_subscription(MarkerArray, '/rviser/right/trajectory', self.right_traj_cb, 10)
-        self.create_subscription(Marker, '/object_marker', self.object_marker_cb, 10)
+        self.create_subscription(Marker, '/foundation_pose/object_marker', self.object_marker_cb, 10)
         self.create_subscription(PoseStamped, '/robot_pose', self.robot_pose_cb, 10)
         self.create_subscription(String, 'robot_description', self.urdf_cb,
                                  QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
@@ -178,18 +179,18 @@ class RviserEmergencyNode(Node):
 
     def _async_load_mesh(self, mesh_resource):
         try:
-            relative_path = mesh_resource[7:].lstrip('/')  
+            relative_path = mesh_resource[7:].lstrip('/')
             mesh_path = Path("/workspace/src/rviser") / relative_path
-            
+
             if not mesh_path.exists():
                 self.get_logger().warn(f"Mesh file not found: {mesh_path}")
                 self.mesh_cache.pop(mesh_resource, None)
                 return
-            
+
             # process=False prevents trimesh from freezing on massive OBJs
-            mesh = trimesh.load(str(mesh_path), force='mesh', process=False) 
+            mesh = trimesh.load(str(mesh_path), force='mesh', process=False)
             mesh.apply_scale(self.mesh_scale)
-            
+
             with self.state_lock:
                 self.mesh_cache[mesh_resource] = mesh
         except Exception as e:
@@ -302,8 +303,8 @@ class RviserEmergencyNode(Node):
 
                 # 4. Update trajectory visualization
                 trajectory_specs = {
-                    "left": (np.array([30, 170, 255], dtype=np.uint8), "/trajectory/left"),
-                    "right": (np.array([255, 120, 30], dtype=np.uint8), "/trajectory/right"),
+                    "left": (np.array([30, 170, 255], dtype=np.uint8), "/robot/trajectory/left"),
+                    "right": (np.array([255, 120, 30], dtype=np.uint8), "/robot/trajectory/right"),
                 }
 
                 for side, (default_color, scene_path) in trajectory_specs.items():
@@ -366,32 +367,43 @@ class RviserEmergencyNode(Node):
                 # 5. Add meshes from object_marker topic (Now Async)
                 if current_marker is not None and current_marker.mesh_resource:
                     mesh = self.mesh_cache.get(current_marker.mesh_resource)
-                    
+                    scene_path = f"/robot/markers/{current_marker.ns}_{current_marker.id}"
+
                     if mesh is not None and mesh != 'loading':
                         pos = np.array([current_marker.pose.position.x, current_marker.pose.position.y, current_marker.pose.position.z])
                         quat = current_marker.pose.orientation
                         wxyz = np.array([quat.w, quat.x, quat.y, quat.z])
-                        
+
                         frame_id = current_marker.header.frame_id
-                        
+
                         if frame_id and frame_id != 'base_link':
                             link_tf = self._get_base_pose_link(frame_id)
                             if link_tf is not None:
                                 marker_local_tf = self._pose_matrix(pos, wxyz)
                                 marker_base_tf = link_tf @ marker_local_tf
-                                
+
                                 pos = marker_base_tf[:3, 3]
                                 x, y, z, w = R.from_matrix(marker_base_tf[:3, :3]).as_quat()
                                 wxyz = np.array([w, x, y, z])
                             else:
                                 continue  # Skip rendering if TF fails for this frame
-                        
-                        self.server.scene.add_mesh_trimesh(
-                            f"/robot/markers/{current_marker.ns}_{current_marker.id}",
-                            mesh=mesh,
-                            wxyz=tuple(wxyz),
-                            position=tuple(pos),
-                        )
+
+                        cached = self.marker_mesh_handles.get(scene_path)
+                        if cached is not None and cached[1] == current_marker.mesh_resource:
+                            # Same mesh already in the scene: just move it, don't re-upload geometry/texture.
+                            handle = cached[0]
+                            handle.wxyz = tuple(wxyz)
+                            handle.position = tuple(pos)
+                        else:
+                            if cached is not None:
+                                cached[0].remove()
+                            handle = self.server.scene.add_mesh_trimesh(
+                                scene_path,
+                                mesh=mesh,
+                                wxyz=tuple(wxyz),
+                                position=tuple(pos),
+                            )
+                            self.marker_mesh_handles[scene_path] = (handle, current_marker.mesh_resource)
 
             self.server.flush()
             time.sleep(0.033) 
