@@ -107,7 +107,7 @@ class RviserEmergencyNode(Node):
         self.create_subscription(PoseStamped, '/robot_pose', self.robot_pose_cb, 10)
         self.create_subscription(String, 'robot_description', self.urdf_cb,
                                  QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
-        self.create_subscription(Image, self.get_parameter('camera_topic').value, self.img_cb, sensor_qos)
+        self.create_subscription(Image, self.get_parameter('camera_topic').value, self.img_cb, 10)
         self.create_subscription(JointState, self.get_parameter('opensot_topic').value, self.opensot_joint_cb, 10)
         self.create_subscription(JointState, self.get_parameter('joint_topic').value, self.joint_cb, 10)
 
