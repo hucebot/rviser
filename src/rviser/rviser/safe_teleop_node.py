@@ -76,7 +76,9 @@ class RviserEmergencyNode(Node):
         self.traj_dirty = {"left": False, "right": False}
         self.traj_handles = {"left": None, "right": None}
         self.marker_mesh_handles = {}  # scene_path -> (handle, mesh_resource)
-        
+        self.marker_last_seen = {}  # scene_path -> monotonic timestamp of last update
+        self.marker_timeout_sec = 1.0  # remove a marker mesh if not refreshed within this long
+
         self.latest_object_marker = None
         self.latest_robot_pose = None
 
@@ -171,6 +173,9 @@ class RviserEmergencyNode(Node):
     def object_marker_cb(self, msg):
         with self.state_lock:
             self.latest_object_marker = msg
+            if msg.mesh_resource and msg.action != Marker.DELETE:
+                scene_path = f"/robot/markers/{msg.ns}_{msg.id}"
+                self.marker_last_seen[scene_path] = time.monotonic()
 
         # Trigger async load to prevent UI freezing
         if msg.mesh_resource and msg.mesh_resource not in self.mesh_cache:
@@ -236,7 +241,8 @@ class RviserEmergencyNode(Node):
                     current_joints = self.latest_joints
                     current_pose = self.latest_robot_pose
                     current_marker = self.latest_object_marker
-                    
+                    current_marker_last_seen = self.marker_last_seen.copy()
+
                     # Copy trajectory data but DO NOT reset self.latest_traj to None
                     current_traj = self.latest_traj.copy()
                     current_traj_colors = self.latest_traj_colors.copy()
@@ -328,9 +334,13 @@ class RviserEmergencyNode(Node):
                     transform_matrix = np.eye(4)
                     points_transformed = points
                     if header_frame != 'base_link':
+                        # graph_inference_node publishes "<target>_exec_anchor" frames via a static
+                        # transform rooted at "opensot/base_link" (OpenSoT's own TF tree), not the
+                        # plain "base_link" tree used everywhere else here - look those up accordingly.
+                        tf_parent_frame = 'opensot/base_link' if header_frame.endswith('_exec_anchor') else 'base_link'
                         try:
                             transform = self.tf_buffer.lookup_transform(
-                                'base_link', header_frame, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.01)
+                                tf_parent_frame, header_frame, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.01)
                             )
                             trans = transform.transform.translation
                             rot = transform.transform.rotation
@@ -365,7 +375,16 @@ class RviserEmergencyNode(Node):
                     )
 
                 # 5. Add meshes from object_marker topic (Now Async)
-                if current_marker is not None and current_marker.mesh_resource:
+                if current_marker is not None and current_marker.mesh_resource and current_marker.action == Marker.DELETE:
+                    scene_path = f"/robot/markers/{current_marker.ns}_{current_marker.id}"
+                    cached = self.marker_mesh_handles.pop(scene_path, None)
+                    if cached is not None:
+                        cached[0].remove()
+                    with self.state_lock:
+                        self.marker_last_seen.pop(scene_path, None)
+                    current_marker_last_seen.pop(scene_path, None)
+
+                elif current_marker is not None and current_marker.mesh_resource:
                     mesh = self.mesh_cache.get(current_marker.mesh_resource)
                     scene_path = f"/robot/markers/{current_marker.ns}_{current_marker.id}"
 
@@ -404,6 +423,20 @@ class RviserEmergencyNode(Node):
                                 position=tuple(pos),
                             )
                             self.marker_mesh_handles[scene_path] = (handle, current_marker.mesh_resource)
+
+                # Remove marker meshes that haven't been refreshed recently (e.g. tracking lost/occluded),
+                # so they don't stay stuck at their last known pose forever.
+                now = time.monotonic()
+                stale_paths = [
+                    path for path in self.marker_mesh_handles
+                    if now - current_marker_last_seen.get(path, 0.0) > self.marker_timeout_sec
+                ]
+                for path in stale_paths:
+                    cached = self.marker_mesh_handles.pop(path, None)
+                    if cached is not None:
+                        cached[0].remove()
+                    with self.state_lock:
+                        self.marker_last_seen.pop(path, None)
 
             self.server.flush()
             time.sleep(0.033) 
