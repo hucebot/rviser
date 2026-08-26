@@ -8,7 +8,7 @@ from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import String
 from visualization_msgs.msg import MarkerArray, Marker
 from geometry_msgs.msg import PoseStamped, TransformStamped
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Path as PathMsg
 import tf2_ros
 import sensor_msgs_py.point_cloud2 as pc2
 import cv_bridge
@@ -108,6 +108,11 @@ class RviserEmergencyNode(Node):
         self.latest_map = None
         self.map_handle = None
 
+        self.latest_local_plan = None
+        self.local_plan_frame = None
+        self.local_plan_dirty = False
+        self.local_plan_handle = None
+
         self.scene_assets_dir = self.file_path.parent.parent / "scene_assets"
         self.exported_poses_dir = self.file_path.parent.parent / "exported_poses"
         self._load_scene_assets()
@@ -167,6 +172,7 @@ class RviserEmergencyNode(Node):
         self.create_subscription(String, '/orchestrator/ui/current_task', self.orchestrator_task_cb, 10)
         self.create_subscription(String, '/orchestrator/ui/current_state', self.orchestrator_state_cb, 10)
         self.create_subscription(OccupancyGrid, '/map', self.map_cb, map_qos)
+        self.create_subscription(PathMsg, '/local_plan', self.local_plan_cb, 10)
 
         threading.Thread(target=self.viser_sync_loop, daemon=True).start()
 
@@ -273,6 +279,19 @@ class RviserEmergencyNode(Node):
         with self.state_lock:
             self.latest_map = msg
 
+    def local_plan_cb(self, msg):
+        with self.state_lock:
+            if not msg.poses:
+                self.latest_local_plan = None
+                self.local_plan_frame = None
+            else:
+                self.latest_local_plan = np.array(
+                    [[p.pose.position.x, p.pose.position.y, p.pose.position.z] for p in msg.poses],
+                    dtype=np.float32,
+                )
+                self.local_plan_frame = msg.header.frame_id
+            self.local_plan_dirty = True
+
     def _update_map_mesh(self, msg: OccupancyGrid):
         self.get_logger().info("Map received! Rendering textured plane...")
 
@@ -356,6 +375,11 @@ class RviserEmergencyNode(Node):
                 # material/texture resolution hang or OOM. Same workaround as
                 # FoundationPoseNode/node.py uses for the same mesh set.
                 mesh = trimesh.load(str(mesh_path), force='mesh', process=False, skip_materials=True)
+                # skip_materials drops the (unusable) per-face materials above, so give
+                # the mesh a plain grey look instead of trimesh's default placeholder.
+                mesh.visual = trimesh.visual.ColorVisuals(
+                    mesh=mesh, vertex_colors=[128, 128, 128, 255]
+                )
             except Exception as e:
                 self.get_logger().error(f"Failed to load scene asset '{object_key}': {e}")
                 continue
@@ -462,11 +486,16 @@ class RviserEmergencyNode(Node):
                     current_traj_frame = self.latest_traj_frame.copy()
                     dirty_flags = self.traj_dirty.copy()
 
+                    current_local_plan = self.latest_local_plan
+                    current_local_plan_frame = self.local_plan_frame
+                    local_plan_dirty = self.local_plan_dirty
+
                     self.latest_img = None
                     self.latest_joints = None
                     self.latest_object_marker = None
                     self.latest_map = None
                     self.traj_dirty = {"left": False, "right": False}
+                    self.local_plan_dirty = False
 
                 # 1. First-person view
                 if self.first_person:
@@ -590,6 +619,45 @@ class RviserEmergencyNode(Node):
                         colors=segment_colors,
                         line_width=4.0,
                     )
+
+                # 4b. Update local plan visualization (Nav2's /local_plan). Added at the
+                # scene root (like the map plane) rather than under "/robot", since a nav
+                # plan is a path through the world, not something attached to the robot body.
+                if local_plan_dirty:
+                    points = current_local_plan
+                    header_frame = current_local_plan_frame
+
+                    if points is None or header_frame is None or points.shape[0] < 2:
+                        if self.local_plan_handle is not None:
+                            self.local_plan_handle.remove()
+                            self.local_plan_handle = None
+                    else:
+                        points_transformed = points
+                        if header_frame != 'map':
+                            try:
+                                transform = self.tf_buffer.lookup_transform(
+                                    'map', header_frame, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.01)
+                                )
+                                trans = transform.transform.translation
+                                rot = transform.transform.rotation
+                                tf_matrix = self._pose_matrix(
+                                    [trans.x, trans.y, trans.z], [rot.w, rot.x, rot.y, rot.z]
+                                )
+                                points_homogeneous = np.hstack([points, np.ones((points.shape[0], 1))])
+                                points_transformed = (tf_matrix @ points_homogeneous.T).T[:, :3]
+                            except Exception as e:
+                                self.get_logger().debug(f"TF lookup failed for local_plan: {e}")
+
+                        if self.local_plan_handle is not None:
+                            self.local_plan_handle.remove()
+
+                        segment_points = np.stack([points_transformed[:-1], points_transformed[1:]], axis=1)
+                        self.local_plan_handle = self.server.scene.add_line_segments(
+                            "/local_plan",
+                            points=segment_points,
+                            colors=np.array([255, 200, 0], dtype=np.uint8),  # amber, distinct from gripper trajectories
+                            line_width=4.0,
+                        )
 
                 # 5. Add meshes from object_marker topic (Now Async)
                 if current_marker is not None and current_marker.mesh_resource and current_marker.action == Marker.DELETE:
