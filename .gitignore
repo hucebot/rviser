@@ -1,3 +1,7 @@
+configs/cyclonedds.xml
+right_hand_trajectory/
+right_hand_trajectory_second/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

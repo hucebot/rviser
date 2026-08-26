@@ -21,6 +21,7 @@ setup(
         'console_scripts': [
             'safe_teleop_node = rviser.safe_teleop_node:main',
             'dummy_trajectory_node = rviser.dummy_trajectory_node:main',
+            'server_message_bridge = rviser.server_message_bridge:main',
         ],
     },
 )

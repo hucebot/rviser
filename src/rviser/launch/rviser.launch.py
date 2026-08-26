@@ -34,8 +34,16 @@ def generate_launch_description() -> LaunchDescription:
         output="screen",
     )
 
+    server_message_bridge = Node(
+        package="rviser",
+        executable="server_message_bridge",
+        name="server_message_bridge",
+        output="screen",
+    )
+
     return LaunchDescription([
         image_decompressor,
         safe_teleop_node,
-        dummy_trajectory_node,
+        # dummy_trajectory_node,
+        server_message_bridge,
     ])

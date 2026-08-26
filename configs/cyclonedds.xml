@@ -3,8 +3,8 @@
         <General>
             <!-- Define which network interface to use -->
             <Interfaces>
-                <NetworkInterface name="enxc0470e98212b" priority="2" presence_required="true" />
-                <!-- <NetworkInterface name="br0" priority="1" presence_required="false" /> -->
+                <NetworkInterface name="enxd43a65190b83" priority="2" presence_required="true" />
+                <NetworkInterface name="lo" priority="1" presence_required="false" />
             </Interfaces>
 
       <!-- Explicitly allow/control multicast -->
@@ -18,7 +18,6 @@
       <Peers>
           <Peer Address="10.68.0.1"/>
           <Peer Address="10.68.0.42"/>
-          <Peer Address="10.68.0.210"/>
           <Peer Address="localhost"/>
       </Peers>
       <MaxAutoParticipantIndex>99</MaxAutoParticipantIndex>
