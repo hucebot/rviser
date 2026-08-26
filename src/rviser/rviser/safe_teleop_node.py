@@ -27,6 +27,34 @@ from pathlib import Path
 from scipy.spatial.transform import Rotation as R
 
 class RviserEmergencyNode(Node):
+    # Category -> display color for the orchestrator status widget.
+    ORCHESTRATOR_CATEGORY_COLORS = {
+        "navigating": "#3b82f6",   # blue
+        "docking": "#8b5cf6",      # purple
+        "localizing": "#eab308",   # yellow
+        "picking": "#f97316",      # orange
+        "placing": "#22c55e",      # green
+        "opening": "#06b6d4",      # cyan
+        "closing": "#0ea5e9",      # sky blue
+        "done": "#6b7280",         # gray
+        "idle": "#6b7280",         # gray
+    }
+
+    # Orchestrator state class name -> category, for states whose category doesn't
+    # depend on which task is active (nav/dock/localize phases are the same for every task).
+    ORCHESTRATOR_STATE_CATEGORIES = {
+        "StartPreNavAndMeshState": "navigating",
+        "WaitPreNavState": "navigating",
+        "StartHomeAndNavState": "navigating",
+        "WaitHomeAndNavState": "navigating",
+        "WaitDockPoseState": "docking",
+        "ExecuteDockState": "docking",
+        "WaitDockState": "docking",
+        "VerifyMeshState": "localizing",
+        "WaitTargetPoseState": "localizing",
+        "DoneState": "done",
+    }
+
     def __init__(self):
         super().__init__('rviser_emergency_node')
 
@@ -56,7 +84,13 @@ class RviserEmergencyNode(Node):
 
         self.server.initial_camera.position = (2.0, 1.0, 1.5)
         self.server.initial_camera.look_at = (0.0, 0.0, 0.0)
-        
+
+        self.latest_orchestrator_task = ""
+        self.latest_orchestrator_state = ""
+        self.status_html = self.server.gui.add_html(
+            self._render_orchestrator_status_html("", "")
+        )
+
         self.img_handle = self.server.gui.add_image(np.zeros((360, 640, 3), dtype=np.uint8), label="Camera")
         self.viser_urdf = None
         
@@ -112,6 +146,8 @@ class RviserEmergencyNode(Node):
         self.create_subscription(Image, self.get_parameter('camera_topic').value, self.img_cb, 10)
         self.create_subscription(JointState, self.get_parameter('opensot_topic').value, self.opensot_joint_cb, 10)
         self.create_subscription(JointState, self.get_parameter('joint_topic').value, self.joint_cb, 10)
+        self.create_subscription(String, '/orchestrator/ui/current_task', self.orchestrator_task_cb, 10)
+        self.create_subscription(String, '/orchestrator/ui/current_state', self.orchestrator_state_cb, 10)
 
         threading.Thread(target=self.viser_sync_loop, daemon=True).start()
 
@@ -205,6 +241,54 @@ class RviserEmergencyNode(Node):
     def robot_pose_cb(self, msg):
         with self.state_lock:
             self.latest_robot_pose = msg
+
+    def orchestrator_task_cb(self, msg):
+        with self.state_lock:
+            self.latest_orchestrator_task = msg.data
+            task, state = self.latest_orchestrator_task, self.latest_orchestrator_state
+        self.status_html.content = self._render_orchestrator_status_html(task, state)
+
+    def orchestrator_state_cb(self, msg):
+        with self.state_lock:
+            self.latest_orchestrator_state = msg.data
+            task, state = self.latest_orchestrator_task, self.latest_orchestrator_state
+        self.status_html.content = self._render_orchestrator_status_html(task, state)
+
+    def _orchestrator_category(self, task_name, state_name):
+        category = self.ORCHESTRATOR_STATE_CATEGORIES.get(state_name)
+        if category is not None:
+            return category
+
+        # Remaining states (ExecuteSkillState/WaitSkillState/TaskDoneState) depend on
+        # which task is actually running the skill.
+        if task_name.startswith("pick_"):
+            return "picking"
+        if task_name.startswith("place_"):
+            return "placing"
+        if task_name == "open_fridge":
+            return "opening"
+        if task_name == "close_fridge":
+            return "closing"
+        return "idle"
+
+    def _render_orchestrator_status_html(self, task_name, state_name):
+        if not task_name and not state_name:
+            category, label = "idle", "IDLE"
+        else:
+            category = self._orchestrator_category(task_name, state_name)
+            label = category.upper()
+        color = self.ORCHESTRATOR_CATEGORY_COLORS.get(category, "#6b7280")
+
+        return f'''
+        <div style="background:{color}; color:white; font-weight:600; text-align:center;
+                    padding:10px 6px; border-radius:6px; font-family:sans-serif;
+                    font-size:14px; letter-spacing:0.5px;">
+          {label}
+          <div style="font-size:11px; font-weight:400; opacity:0.85; margin-top:2px;">
+            {task_name or "&mdash;"}
+          </div>
+        </div>
+        '''
 
     def _get_base_pose_link(self, link_name):
         try:
