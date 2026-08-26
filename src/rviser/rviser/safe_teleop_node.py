@@ -24,7 +24,7 @@ from PIL import Image as PILImage
 import logging
 logging.getLogger('yourdfpy.urdf').setLevel(logging.ERROR)
 
-import io, threading, time, cv2, os
+import io, json, threading, time, cv2, os
 from ament_index_python.packages import get_package_share_directory
 from pathlib import Path
 from scipy.spatial.transform import Rotation as R
@@ -100,13 +100,17 @@ class RviserEmergencyNode(Node):
         self.traj_handles = {"left": None, "right": None}
         self.marker_mesh_handles = {}  # scene_path -> (handle, mesh_resource)
         self.marker_last_seen = {}  # scene_path -> monotonic timestamp of last update
-        self.marker_timeout_sec = 1.0  # remove a marker mesh if not refreshed within this long
+        self.marker_timeout_sec = 3.0  # remove a marker mesh if not refreshed within this long
 
         self.latest_object_marker = None
         self.latest_robot_pose = None
 
         self.latest_map = None
         self.map_handle = None
+
+        self.scene_assets_dir = self.file_path.parent.parent / "scene_assets"
+        self.exported_poses_dir = self.file_path.parent.parent / "exported_poses"
+        self._load_scene_assets()
 
         # Parameters
         self.declare_parameter('first_person', False)
@@ -318,6 +322,54 @@ class RviserEmergencyNode(Node):
             wxyz=(origin.orientation.w, origin.orientation.x, origin.orientation.y, origin.orientation.z),
         )
 
+    def _load_scene_assets(self):
+        """Loads static scene object meshes (from scene_assets/) at their latest
+        exported pose (from exported_poses/<object_key>/pose_*.json, written by
+        scene_manager's manual_adjust_node). These are placed once at startup,
+        in the "map" frame, alongside the map's textured plane."""
+        if not self.exported_poses_dir.is_dir():
+            return
+
+        for object_dir in sorted(self.exported_poses_dir.iterdir()):
+            if not object_dir.is_dir():
+                continue
+
+            pose_files = sorted(object_dir.glob("pose_*.json"))
+            if not pose_files:
+                continue
+            latest_pose_file = pose_files[-1]
+
+            object_key = object_dir.name
+            mesh_path = self.scene_assets_dir / f"{object_key}.obj"
+            if not mesh_path.exists():
+                self.get_logger().warn(f"Scene asset mesh not found for '{object_key}': {mesh_path}")
+                continue
+
+            try:
+                with open(latest_pose_file) as f:
+                    pose = json.load(f)
+                position = pose["position"]
+                orientation = pose["orientation"]
+
+                # skip_materials: these scanned OBJs carry thousands of near-duplicate
+                # per-face materials (e.g. 3700+ for the table), which makes trimesh's
+                # material/texture resolution hang or OOM. Same workaround as
+                # FoundationPoseNode/node.py uses for the same mesh set.
+                mesh = trimesh.load(str(mesh_path), force='mesh', process=False, skip_materials=True)
+            except Exception as e:
+                self.get_logger().error(f"Failed to load scene asset '{object_key}': {e}")
+                continue
+
+            self.server.scene.add_mesh_trimesh(
+                f"/scene_assets/{object_key}",
+                mesh=mesh,
+                position=(position["x"], position["y"], position["z"]),
+                wxyz=(orientation["w"], orientation["x"], orientation["y"], orientation["z"]),
+            )
+            self.get_logger().info(
+                f"Loaded scene asset '{object_key}' at exported pose {latest_pose_file.name}"
+            )
+
     def orchestrator_task_cb(self, msg):
         with self.state_lock:
             self.latest_orchestrator_task = msg.data
@@ -430,7 +482,7 @@ class RviserEmergencyNode(Node):
                                 with client.atomic():
                                     client.camera.position = (float(world_position[0]), float(world_position[1]), float(world_position[2]))
                                     camera_look_at = world_position + world_rotation @ np.array([1.0, 0.0, 0.0], dtype=np.float64)
-                                    client.camera.look_at = (float(camera_look_at[0] + 0.5), float(camera_look_at[1]), float(camera_look_at[2]))
+                                    client.camera.look_at = (float(camera_look_at[0] + 0.7), float(camera_look_at[1]), float(camera_look_at[2]))
                                     client.camera.fov = float(np.deg2rad(self.first_person_fov_deg))
                             except Exception:
                                 pass

@@ -1,0 +1,27 @@
+{
+  "object_key": "table_ikea_scaled_centered_with_pan_apriltag",
+  "source": "corrected",
+  "exported_at": "20260826_153316",
+  "map_frame_id": "map",
+  "position": {
+    "x": -3.252948595544392,
+    "y": 0.24501722898283484,
+    "z": 0.7089192637553227
+  },
+  "orientation": {
+    "x": 0.0,
+    "y": 0.0,
+    "z": -0.18365922352182495,
+    "w": 0.982989974320878
+  },
+  "rpy_rad": {
+    "roll": 0.0,
+    "pitch": 0.0,
+    "yaw": -0.36941542057779325
+  },
+  "rpy_deg": {
+    "roll": 0.0,
+    "pitch": 0.0,
+    "yaw": -21.165944486157816
+  }
+}
