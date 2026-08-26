@@ -2,6 +2,7 @@ from http import server
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from rclpy.parameter import Parameter
 from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import String
@@ -69,13 +70,17 @@ class RviserEmergencyNode(Node):
         self.server.initial_camera.position = (2.0, 1.0, 1.5)
         self.server.initial_camera.look_at = (0.0, 0.0, 0.0)
 
+        # GUI is organized into tabs (like browser tabs): switching tabs swaps the whole panel.
+        self.gui_tab_group = self.server.gui.add_tab_group()
+
         self.latest_orchestrator_task = ""
         self.latest_orchestrator_state = ""
-        self.status_html = self.server.gui.add_html(
-            self._render_orchestrator_status_html("", "")
-        )
+        with self.gui_tab_group.add_tab("Main"):
+            self.status_html = self.server.gui.add_html(
+                self._render_orchestrator_status_html("", "")
+            )
+            self.img_handle = self.server.gui.add_image(np.zeros((360, 640, 3), dtype=np.uint8), label="Camera")
 
-        self.img_handle = self.server.gui.add_image(np.zeros((360, 640, 3), dtype=np.uint8), label="Camera")
         self.viser_urdf = None
         
         self.tf_buffer = tf2_ros.Buffer()
@@ -113,9 +118,23 @@ class RviserEmergencyNode(Node):
         self.first_person = self.get_parameter('first_person').value
         self.show_opensot = self.get_parameter('show_opensot').value
         self.first_person_link = 'head_front_camera_link'
+        self.first_person_fov_deg = float(np.rad2deg(self.server.initial_camera.fov))  # zoom: smaller = zoomed in
         self._first_person_active_last_frame = self.first_person
 
         self.add_on_set_parameters_callback(self.parameter_callback)
+
+        # Extra GUI tab for manual controls (buttons/sliders go here)
+        with self.gui_tab_group.add_tab("Controls"):
+            self.first_person_button = self.server.gui.add_button("Enable First Person", color="green")
+            self.first_person_button.on_click(lambda _: self._toggle_first_person())
+
+            self.first_person_fov_slider = self.server.gui.add_slider(
+                "Zoom (FOV °)", min=20.0, max=120.0, step=1.0,
+                initial_value=self.first_person_fov_deg,
+            )
+            self.first_person_fov_slider.on_update(
+                lambda event: setattr(self, "first_person_fov_deg", event.target.value)
+            )
 
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -154,6 +173,14 @@ class RviserEmergencyNode(Node):
             elif param.name == 'show_opensot':
                 self.show_opensot = param.value
         return SetParametersResult(successful=True)
+
+    def _toggle_first_person(self):
+        new_value = not self.first_person
+        self.set_parameters([Parameter('first_person', Parameter.Type.BOOL, new_value)])
+
+        self.first_person_button.label = "Disable First Person" if new_value else "Enable First Person"
+        self.first_person_button.color = "red" if new_value else "green"
+        self.get_logger().info(f"First-person view {'enabled' if new_value else 'disabled'} via GUI button.")
 
     def img_cb(self, msg):
         with self.state_lock:
@@ -402,19 +429,22 @@ class RviserEmergencyNode(Node):
                             try:
                                 with client.atomic():
                                     client.camera.position = (float(world_position[0]), float(world_position[1]), float(world_position[2]))
-                                    camera_look_at = world_position + world_rotation @ np.array([1.0, 0.0, 0.0], dtype=np.float64) 
-                                    client.camera.look_at = (float(camera_look_at[0]) + 0.5, float(camera_look_at[1]), float(camera_look_at[2]))
+                                    camera_look_at = world_position + world_rotation @ np.array([1.0, 0.0, 0.0], dtype=np.float64)
+                                    client.camera.look_at = (float(camera_look_at[0] + 0.5), float(camera_look_at[1]), float(camera_look_at[2]))
+                                    client.camera.fov = float(np.deg2rad(self.first_person_fov_deg))
                             except Exception:
                                 pass
                 elif self._first_person_active_last_frame:
                     default_position = tuple(float(v) for v in self.server.initial_camera.position)
                     default_look_at = tuple(float(v) for v in self.server.initial_camera.look_at)
+                    default_fov = float(self.server.initial_camera.fov)
 
                     for client in self.server.get_clients().values():
                         try:
                             with client.atomic():
                                 client.camera.position = default_position
                                 client.camera.look_at = default_look_at
+                                client.camera.fov = default_fov
                         except Exception:
                             pass
 
