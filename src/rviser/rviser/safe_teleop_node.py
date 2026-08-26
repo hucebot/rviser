@@ -7,6 +7,7 @@ from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import String
 from visualization_msgs.msg import MarkerArray, Marker
 from geometry_msgs.msg import PoseStamped, TransformStamped
+from nav_msgs.msg import OccupancyGrid
 import tf2_ros
 import sensor_msgs_py.point_cloud2 as pc2
 import cv_bridge
@@ -16,6 +17,7 @@ import trimesh
 from viser import transforms as tf
 from viser.extras import ViserUrdf
 import yourdfpy
+from PIL import Image as PILImage
 
 # Suppress the annoying mimic joint warnings from yourdfpy
 import logging
@@ -61,24 +63,6 @@ class RviserEmergencyNode(Node):
         self.server = viser.ViserServer()
         self.bridge = cv_bridge.CvBridge()
         self.state_lock = threading.Lock()
-
-        # Add a static floor (thin box) to the 3D scene
-        floor_urdf = '''<?xml version="1.0"?>
-        <robot name="floor">
-            <link name="floor_link">
-                <visual>
-                    <origin xyz="0 0 -0.01" rpy="0 0 0"/>
-                    <geometry>
-                        <box size="100 100 0.02"/>
-                    </geometry>
-                    <material name="gray">
-                        <color rgba="0.5 0.5 0.5 1.0"/>
-                    </material>
-                </visual>
-            </link>
-        </robot>
-        '''
-        self.floor_urdf = ViserUrdf(self.server, yourdfpy.URDF.load(io.StringIO(floor_urdf)), root_node_name="/floor")
         
         self.robot_frame = self.server.scene.add_frame("/robot")
 
@@ -116,6 +100,9 @@ class RviserEmergencyNode(Node):
         self.latest_object_marker = None
         self.latest_robot_pose = None
 
+        self.latest_map = None
+        self.map_handle = None
+
         # Parameters
         self.declare_parameter('first_person', False)
         self.declare_parameter('show_opensot', False)
@@ -136,6 +123,14 @@ class RviserEmergencyNode(Node):
             depth=1
         )
 
+        # Latched QoS for the /map topic (matches map_server's TRANSIENT_LOCAL publisher)
+        map_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+
         # Subscriptions
         self.create_subscription(MarkerArray, '/rviser/left/trajectory', self.left_traj_cb, 10)
         self.create_subscription(MarkerArray, '/rviser/right/trajectory', self.right_traj_cb, 10)
@@ -148,6 +143,7 @@ class RviserEmergencyNode(Node):
         self.create_subscription(JointState, self.get_parameter('joint_topic').value, self.joint_cb, 10)
         self.create_subscription(String, '/orchestrator/ui/current_task', self.orchestrator_task_cb, 10)
         self.create_subscription(String, '/orchestrator/ui/current_state', self.orchestrator_state_cb, 10)
+        self.create_subscription(OccupancyGrid, '/map', self.map_cb, map_qos)
 
         threading.Thread(target=self.viser_sync_loop, daemon=True).start()
 
@@ -242,6 +238,59 @@ class RviserEmergencyNode(Node):
         with self.state_lock:
             self.latest_robot_pose = msg
 
+    def map_cb(self, msg):
+        with self.state_lock:
+            self.latest_map = msg
+
+    def _update_map_mesh(self, msg: OccupancyGrid):
+        self.get_logger().info("Map received! Rendering textured plane...")
+
+        width = msg.info.width
+        height = msg.info.height
+        resolution = msg.info.resolution
+        origin = msg.info.origin
+
+        # Parse ROS occupancy array
+        grid = np.array(msg.data, dtype=np.int8).reshape((height, width))
+
+        # Build RGB image
+        img_data = np.zeros((height, width, 3), dtype=np.uint8)
+        img_data[grid == -1] = [120, 120, 120]  # Unknown
+        img_data[grid == 0] = [255, 255, 255]   # Free
+        img_data[grid > 50] = [0, 0, 0]         # Obstacles
+
+        img_data = np.flipud(img_data)
+        texture_img = PILImage.fromarray(img_data)
+
+        # Flat rectangle mesh on the XY plane
+        real_width = width * resolution
+        real_height = height * resolution
+
+        vertices = np.array([
+            [0, 0, 0],
+            [real_width, 0, 0],
+            [real_width, real_height, 0],
+            [0, real_height, 0],
+        ])
+        faces = np.array([[0, 1, 2], [0, 2, 3]])
+        uvs = np.array([[0, 0], [1, 0], [1, 1], [0, 1]])
+
+        material = trimesh.visual.texture.SimpleMaterial(image=texture_img)
+        visuals = trimesh.visual.TextureVisuals(uv=uvs, image=texture_img, material=material)
+        mesh = trimesh.Trimesh(vertices=vertices, faces=faces, visual=visuals)
+
+        if self.map_handle is not None:
+            self.map_handle.remove()
+
+        # Root-level scene node (not nested under "/robot"): the map is static in the
+        # world/"map" frame, unlike the robot which moves within it via self.robot_frame.
+        self.map_handle = self.server.scene.add_mesh_trimesh(
+            "/map/textured_plane",
+            mesh=mesh,
+            position=(origin.position.x, origin.position.y, origin.position.z),
+            wxyz=(origin.orientation.w, origin.orientation.x, origin.orientation.y, origin.orientation.z),
+        )
+
     def orchestrator_task_cb(self, msg):
         with self.state_lock:
             self.latest_orchestrator_task = msg.data
@@ -326,16 +375,18 @@ class RviserEmergencyNode(Node):
                     current_pose = self.latest_robot_pose
                     current_marker = self.latest_object_marker
                     current_marker_last_seen = self.marker_last_seen.copy()
+                    current_map = self.latest_map
 
                     # Copy trajectory data but DO NOT reset self.latest_traj to None
                     current_traj = self.latest_traj.copy()
                     current_traj_colors = self.latest_traj_colors.copy()
                     current_traj_frame = self.latest_traj_frame.copy()
                     dirty_flags = self.traj_dirty.copy()
-                    
+
                     self.latest_img = None
                     self.latest_joints = None
                     self.latest_object_marker = None
+                    self.latest_map = None
                     self.traj_dirty = {"left": False, "right": False}
 
                 # 1. First-person view
@@ -521,6 +572,10 @@ class RviserEmergencyNode(Node):
                         cached[0].remove()
                     with self.state_lock:
                         self.marker_last_seen.pop(path, None)
+
+                # 6. Map (occupancy grid rendered as a textured ground plane)
+                if current_map is not None:
+                    self._update_map_mesh(current_map)
 
             self.server.flush()
             time.sleep(0.033) 
