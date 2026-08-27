@@ -48,8 +48,8 @@ STATE_PHASES = {
     "WaitDockPoseState": "docking",
     "ExecuteDockState": "docking",
     "WaitDockState": "docking",
-    "VerifyMeshState": "localizing object",
-    "WaitTargetPoseState": "localizing object",
+    "VerifyMeshState": "locating object",
+    "WaitTargetPoseState": "locating object",
     "TaskDoneState": "task_done",
     "DoneState": "all_done",
 }
@@ -77,7 +77,7 @@ def narrate(task_name, state_name):
         return f"The robot is on its way to {obj}."
     if phase == "docking":
         return f"The robot is getting into position near {obj}."
-    if phase == "localizing object":
+    if phase == "locating object":
         return f"The robot is spotting {obj} and planning its next move."
     if phase == "task_done":
         return f"Done! The robot just finished {verb_ing} {obj}."
