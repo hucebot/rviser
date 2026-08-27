@@ -5,10 +5,10 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from rclpy.parameter import Parameter
 from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import Image, JointState
-from std_msgs.msg import String
+from std_msgs.msg import String, Float32
 from visualization_msgs.msg import MarkerArray, Marker
 from geometry_msgs.msg import PoseStamped, TransformStamped
-from nav_msgs.msg import OccupancyGrid, Path as PathMsg
+from nav_msgs.msg import Path as PathMsg
 import tf2_ros
 import sensor_msgs_py.point_cloud2 as pc2
 import cv_bridge
@@ -18,7 +18,6 @@ import trimesh
 from viser import transforms as tf
 from viser.extras import ViserUrdf
 import yourdfpy
-from PIL import Image as PILImage
 
 # Suppress the annoying mimic joint warnings from yourdfpy
 import logging
@@ -34,12 +33,12 @@ class RviserEmergencyNode(Node):
     ORCHESTRATOR_CATEGORY_COLORS = {
         "navigating": "#3b82f6",   # blue
         "docking": "#8b5cf6",      # purple
-        "localizing": "#eab308",   # yellow
+        "locating": "#eab308",   # yellow
         "picking": "#f97316",      # orange
-        "placing": "#22c55e",      # green
+        "placing": "#02501f",      # dark green
         "opening": "#06b6d4",      # cyan
         "closing": "#0ea5e9",      # sky blue
-        "done": "#6b7280",         # gray
+        "done": "#06E02A",         # light green
         "idle": "#6b7280",         # gray
     }
 
@@ -53,9 +52,17 @@ class RviserEmergencyNode(Node):
         "WaitDockPoseState": "docking",
         "ExecuteDockState": "docking",
         "WaitDockState": "docking",
-        "VerifyMeshState": "localizing",
-        "WaitTargetPoseState": "localizing",
+        "VerifyMeshState": "locating",
+        "WaitTargetPoseState": "locating",
         "DoneState": "done",
+    }
+
+    # Two scene_assets mesh variants for the same physical fridge - the orchestrator's
+    # "open_fridge"/"close_fridge" tasks (pick_place_orchestrator.py: PickPlaceOrchestrator.tasks)
+    # toggle which one is visible once the corresponding skill actually finishes.
+    FRIDGE_SCENE_ASSET_KEYS = {
+        "closed": "inria_fridge_closed_and_full_kitchen_centered_apriltag",
+        "open": "inria_fridge_open_and_full_kitchen_centered_apriltag",
     }
 
     def __init__(self):
@@ -66,6 +73,7 @@ class RviserEmergencyNode(Node):
         self.state_lock = threading.Lock()
         
         self.robot_frame = self.server.scene.add_frame("/robot")
+        self.server.scene.add_grid("/ground_grid", width=20.0, height=20.0, cell_size=0.5)
 
         self.server.initial_camera.position = (2.0, 1.0, 1.5)
         self.server.initial_camera.look_at = (0.0, 0.0, 0.0)
@@ -87,8 +95,12 @@ class RviserEmergencyNode(Node):
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         self.file_path = Path(__file__).resolve()
-        self.mesh_cache = {}  
+        self.mesh_cache = {}
         self.mesh_scale = 1.
+
+        self.battery_level_topic = self.declare_parameter('battery_level_topic', '/power/battery_level').value
+        self.latest_battery_pct = None
+        self.last_rendered_battery = -1
 
         # Internal State Buffers
         self.latest_img = None
@@ -105,13 +117,12 @@ class RviserEmergencyNode(Node):
         self.latest_object_marker = None
         self.latest_robot_pose = None
 
-        self.latest_map = None
-        self.map_handle = None
-
         self.latest_local_plan = None
         self.local_plan_frame = None
         self.local_plan_dirty = False
         self.local_plan_handle = None
+
+        self.fridge_mesh_handles = {}  # "open"/"closed" -> mesh handle, filled in by _load_scene_assets
 
         self.scene_assets_dir = self.file_path.parent.parent / "scene_assets"
         self.exported_poses_dir = self.file_path.parent.parent / "exported_poses"
@@ -145,16 +156,11 @@ class RviserEmergencyNode(Node):
                 lambda event: setattr(self, "first_person_fov_deg", event.target.value)
             )
 
+        # Absolute-positioned HTML overlay for the battery indicator (top left corner)
+        self.battery_html = self.server.gui.add_html(self._render_battery_html(None))
+
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1
-        )
-
-        # Latched QoS for the /map topic (matches map_server's TRANSIENT_LOCAL publisher)
-        map_qos = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
             depth=1
         )
@@ -171,8 +177,8 @@ class RviserEmergencyNode(Node):
         self.create_subscription(JointState, self.get_parameter('joint_topic').value, self.joint_cb, 10)
         self.create_subscription(String, '/orchestrator/ui/current_task', self.orchestrator_task_cb, 10)
         self.create_subscription(String, '/orchestrator/ui/current_state', self.orchestrator_state_cb, 10)
-        self.create_subscription(OccupancyGrid, '/map', self.map_cb, map_qos)
         self.create_subscription(PathMsg, '/local_plan', self.local_plan_cb, 10)
+        self.create_subscription(Float32, self.battery_level_topic, self.battery_level_callback, 10)
 
         threading.Thread(target=self.viser_sync_loop, daemon=True).start()
 
@@ -183,6 +189,38 @@ class RviserEmergencyNode(Node):
             elif param.name == 'show_opensot':
                 self.show_opensot = param.value
         return SetParametersResult(successful=True)
+
+    def battery_level_callback(self, msg):
+        with self.state_lock:
+            val = msg.data
+            # Accept either a 0-1 normalized level or an already-percent value.
+            if 0.0 < val <= 1.0:
+                self.latest_battery_pct = int(val * 100)
+            else:
+                self.latest_battery_pct = int(val)
+
+    def _render_battery_html(self, percentage):
+        if percentage is None:
+            val = "--"
+            width = 0
+            color = "gray"
+        else:
+            val = int(percentage)
+            width = max(0, min(100, val))
+            color = "#22c55e" if val > 45 else "#ef4444"
+
+        return f'''
+        <div style="position: fixed; bottom: 15px; right: 15px; z-index: 9999;
+                    display: flex; align-items: center; gap: 8px;
+                    background: rgba(0, 0, 0, 0.6); padding: 8px 12px;
+                    border-radius: 8px; color: white; font-family: sans-serif; font-weight: bold; pointer-events: none;">
+            <div style="width: 30px; height: 14px; border: 2px solid white; border-radius: 3px; position: relative; padding: 1px;">
+                <div style="width: {width}%; height: 100%; background: {color}; border-radius: 1px; transition: width 0.3s ease;"></div>
+                <div style="position: absolute; right: -4px; top: 3px; width: 2px; height: 6px; background: white; border-radius: 0 2px 2px 0;"></div>
+            </div>
+            <div style="font-size: 14px; min-width: 40px;">{val}%</div>
+        </div>
+        '''
 
     def _toggle_first_person(self):
         new_value = not self.first_person
@@ -275,10 +313,6 @@ class RviserEmergencyNode(Node):
         with self.state_lock:
             self.latest_robot_pose = msg
 
-    def map_cb(self, msg):
-        with self.state_lock:
-            self.latest_map = msg
-
     def local_plan_cb(self, msg):
         with self.state_lock:
             if not msg.poses:
@@ -292,62 +326,15 @@ class RviserEmergencyNode(Node):
                 self.local_plan_frame = msg.header.frame_id
             self.local_plan_dirty = True
 
-    def _update_map_mesh(self, msg: OccupancyGrid):
-        self.get_logger().info("Map received! Rendering textured plane...")
-
-        width = msg.info.width
-        height = msg.info.height
-        resolution = msg.info.resolution
-        origin = msg.info.origin
-
-        # Parse ROS occupancy array
-        grid = np.array(msg.data, dtype=np.int8).reshape((height, width))
-
-        # Build RGB image
-        img_data = np.zeros((height, width, 3), dtype=np.uint8)
-        img_data[grid == -1] = [120, 120, 120]  # Unknown
-        img_data[grid == 0] = [255, 255, 255]   # Free
-        img_data[grid > 50] = [0, 0, 0]         # Obstacles
-
-        img_data = np.flipud(img_data)
-        texture_img = PILImage.fromarray(img_data)
-
-        # Flat rectangle mesh on the XY plane
-        real_width = width * resolution
-        real_height = height * resolution
-
-        vertices = np.array([
-            [0, 0, 0],
-            [real_width, 0, 0],
-            [real_width, real_height, 0],
-            [0, real_height, 0],
-        ])
-        faces = np.array([[0, 1, 2], [0, 2, 3]])
-        uvs = np.array([[0, 0], [1, 0], [1, 1], [0, 1]])
-
-        material = trimesh.visual.texture.SimpleMaterial(image=texture_img)
-        visuals = trimesh.visual.TextureVisuals(uv=uvs, image=texture_img, material=material)
-        mesh = trimesh.Trimesh(vertices=vertices, faces=faces, visual=visuals)
-
-        if self.map_handle is not None:
-            self.map_handle.remove()
-
-        # Root-level scene node (not nested under "/robot"): the map is static in the
-        # world/"map" frame, unlike the robot which moves within it via self.robot_frame.
-        self.map_handle = self.server.scene.add_mesh_trimesh(
-            "/map/textured_plane",
-            mesh=mesh,
-            position=(origin.position.x, origin.position.y, origin.position.z),
-            wxyz=(origin.orientation.w, origin.orientation.x, origin.orientation.y, origin.orientation.z),
-        )
-
     def _load_scene_assets(self):
         """Loads static scene object meshes (from scene_assets/) at their latest
         exported pose (from exported_poses/<object_key>/pose_*.json, written by
         scene_manager's manual_adjust_node). These are placed once at startup,
-        in the "map" frame, alongside the map's textured plane."""
+        as root-level scene nodes in the "map" frame."""
         if not self.exported_poses_dir.is_dir():
             return
+
+        fridge_key_to_state = {v: k for k, v in self.FRIDGE_SCENE_ASSET_KEYS.items()}
 
         for object_dir in sorted(self.exported_poses_dir.iterdir()):
             if not object_dir.is_dir():
@@ -384,7 +371,7 @@ class RviserEmergencyNode(Node):
                 self.get_logger().error(f"Failed to load scene asset '{object_key}': {e}")
                 continue
 
-            self.server.scene.add_mesh_trimesh(
+            handle = self.server.scene.add_mesh_trimesh(
                 f"/scene_assets/{object_key}",
                 mesh=mesh,
                 position=(position["x"], position["y"], position["z"]),
@@ -393,6 +380,30 @@ class RviserEmergencyNode(Node):
             self.get_logger().info(
                 f"Loaded scene asset '{object_key}' at exported pose {latest_pose_file.name}"
             )
+
+            fridge_state = fridge_key_to_state.get(object_key)
+            if fridge_state is not None:
+                # Both variants are loaded up front so swapping is instant (no trimesh
+                # reload); only the "closed" one starts visible.
+                handle.visible = (fridge_state == "closed")
+                self.fridge_mesh_handles[fridge_state] = handle
+
+    def _set_fridge_open(self, is_open: bool):
+        closed_handle = self.fridge_mesh_handles.get("closed")
+        open_handle = self.fridge_mesh_handles.get("open")
+        if closed_handle is not None:
+            closed_handle.visible = not is_open
+        if open_handle is not None:
+            open_handle.visible = is_open
+
+    def _clear_hand_trajectories(self):
+        """Drops the last-drawn gripper trajectory lines so they don't linger in the
+        scene once the pick/place skill that produced them has finished."""
+        with self.state_lock:
+            self.latest_traj = {"left": None, "right": None}
+            self.latest_traj_colors = {"left": None, "right": None}
+            self.latest_traj_frame = {"left": None, "right": None}
+            self.traj_dirty = {"left": True, "right": True}
 
     def orchestrator_task_cb(self, msg):
         with self.state_lock:
@@ -405,6 +416,22 @@ class RviserEmergencyNode(Node):
             self.latest_orchestrator_state = msg.data
             task, state = self.latest_orchestrator_task, self.latest_orchestrator_state
         self.status_html.content = self._render_orchestrator_status_html(task, state)
+
+        # The fridge mesh only flips once its skill has actually finished (TaskDoneState),
+        # i.e. once the physical door motion is done - see pick_place_orchestrator.py's
+        # "open_fridge"/"close_fridge" tasks and their ExecuteSkillState -> WaitSkillState
+        # -> TaskDoneState transition.
+        if state == "TaskDoneState":
+            if task == "open_fridge":
+                self._set_fridge_open(True)
+            elif task == "close_fridge":
+                self._set_fridge_open(False)
+
+            # The hand trajectory line is only useful while the pick/place is in
+            # flight; once the skill finishes, clear it so it doesn't stay drawn
+            # at the gripper's last pose.
+            if task.startswith("pick_") or task.startswith("place_"):
+                self._clear_hand_trajectories()
 
     def _orchestrator_category(self, task_name, state_name):
         category = self.ORCHESTRATOR_STATE_CATEGORIES.get(state_name)
@@ -478,7 +505,7 @@ class RviserEmergencyNode(Node):
                     current_pose = self.latest_robot_pose
                     current_marker = self.latest_object_marker
                     current_marker_last_seen = self.marker_last_seen.copy()
-                    current_map = self.latest_map
+                    current_battery = self.latest_battery_pct
 
                     # Copy trajectory data but DO NOT reset self.latest_traj to None
                     current_traj = self.latest_traj.copy()
@@ -493,7 +520,6 @@ class RviserEmergencyNode(Node):
                     self.latest_img = None
                     self.latest_joints = None
                     self.latest_object_marker = None
-                    self.latest_map = None
                     self.traj_dirty = {"left": False, "right": False}
                     self.local_plan_dirty = False
 
@@ -621,8 +647,8 @@ class RviserEmergencyNode(Node):
                     )
 
                 # 4b. Update local plan visualization (Nav2's /local_plan). Added at the
-                # scene root (like the map plane) rather than under "/robot", since a nav
-                # plan is a path through the world, not something attached to the robot body.
+                # scene root (like the scene_assets meshes) rather than under "/robot", since
+                # a nav plan is a path through the world, not something attached to the robot body.
                 if local_plan_dirty:
                     points = current_local_plan
                     header_frame = current_local_plan_frame
@@ -655,7 +681,7 @@ class RviserEmergencyNode(Node):
                         self.local_plan_handle = self.server.scene.add_line_segments(
                             "/local_plan",
                             points=segment_points,
-                            colors=np.array([255, 200, 0], dtype=np.uint8),  # amber, distinct from gripper trajectories
+                            colors=np.array([0, 0, 0], dtype=np.uint8),  # black, distinct from gripper trajectories
                             line_width=4.0,
                         )
 
@@ -723,9 +749,10 @@ class RviserEmergencyNode(Node):
                     with self.state_lock:
                         self.marker_last_seen.pop(path, None)
 
-                # 6. Map (occupancy grid rendered as a textured ground plane)
-                if current_map is not None:
-                    self._update_map_mesh(current_map)
+                # 6. Battery indicator overlay
+                if current_battery is not None and current_battery != self.last_rendered_battery:
+                    self.battery_html.content = self._render_battery_html(current_battery)
+                    self.last_rendered_battery = current_battery
 
             self.server.flush()
             time.sleep(0.033) 
