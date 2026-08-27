@@ -159,10 +159,16 @@ class RviserEmergencyNode(Node):
         # Absolute-positioned HTML overlay for the battery indicator (top left corner)
         self.battery_html = self.server.gui.add_html(self._render_battery_html(None))
 
-        sensor_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
+        # Matches orchestrator_node.py's qos_state: current_task/current_state are only
+        # published on change, so TRANSIENT_LOCAL is needed here too to get the last value
+        # on connect (e.g. if this node starts/restarts after the orchestrator already moved
+        # past a task/state) - a VOLATILE subscriber does not get replayed history even
+        # against a TRANSIENT_LOCAL publisher.
+        orchestrator_ui_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
-            depth=1
+            depth=3,
         )
 
         # Subscriptions
@@ -175,8 +181,8 @@ class RviserEmergencyNode(Node):
         self.create_subscription(Image, self.get_parameter('camera_topic').value, self.img_cb, 10)
         self.create_subscription(JointState, self.get_parameter('opensot_topic').value, self.opensot_joint_cb, 10)
         self.create_subscription(JointState, self.get_parameter('joint_topic').value, self.joint_cb, 10)
-        self.create_subscription(String, '/orchestrator/ui/current_task', self.orchestrator_task_cb, 10)
-        self.create_subscription(String, '/orchestrator/ui/current_state', self.orchestrator_state_cb, 10)
+        self.create_subscription(String, '/orchestrator/ui/current_task', self.orchestrator_task_cb, orchestrator_ui_qos)
+        self.create_subscription(String, '/orchestrator/ui/current_state', self.orchestrator_state_cb, orchestrator_ui_qos)
         self.create_subscription(PathMsg, '/local_plan', self.local_plan_cb, 10)
         self.create_subscription(Float32, self.battery_level_topic, self.battery_level_callback, 10)
 

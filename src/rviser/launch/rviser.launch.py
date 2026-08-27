@@ -44,6 +44,5 @@ def generate_launch_description() -> LaunchDescription:
     return LaunchDescription([
         image_decompressor,
         safe_teleop_node,
-        # dummy_trajectory_node,
         server_message_bridge,
     ])
