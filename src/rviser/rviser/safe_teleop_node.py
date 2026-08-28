@@ -4,7 +4,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from rclpy.parameter import Parameter
 from rcl_interfaces.msg import SetParametersResult
-from sensor_msgs.msg import Image, JointState
+from sensor_msgs.msg import Image, JointState, BatteryState
 from std_msgs.msg import String, Float32
 from visualization_msgs.msg import MarkerArray, Marker
 from geometry_msgs.msg import PoseStamped, TransformStamped
@@ -23,7 +23,7 @@ import yourdfpy
 import logging
 logging.getLogger('yourdfpy.urdf').setLevel(logging.ERROR)
 
-import io, json, threading, time, cv2, os
+import base64, io, json, threading, time, cv2, os
 from ament_index_python.packages import get_package_share_directory
 from pathlib import Path
 from scipy.spatial.transform import Rotation as R
@@ -102,6 +102,10 @@ class RviserEmergencyNode(Node):
         self.latest_battery_pct = None
         self.last_rendered_battery = -1
 
+        self.laptop_battery_topic = self.declare_parameter('laptop_battery_topic', 'laptop_battery').value
+        self.latest_laptop_battery_pct = None
+        self.last_rendered_laptop_battery = -1
+
         # Internal State Buffers
         self.latest_img = None
         self.latest_joints = None
@@ -127,6 +131,8 @@ class RviserEmergencyNode(Node):
         self.scene_assets_dir = self.file_path.parent.parent / "scene_assets"
         self.exported_poses_dir = self.file_path.parent.parent / "exported_poses"
         self._load_scene_assets()
+
+        self.assets_dir = self.file_path.parent.parent / "assets"
 
         # Parameters
         self.declare_parameter('first_person', False)
@@ -156,8 +162,19 @@ class RviserEmergencyNode(Node):
                 lambda event: setattr(self, "first_person_fov_deg", event.target.value)
             )
 
-        # Absolute-positioned HTML overlay for the battery indicator (top left corner)
-        self.battery_html = self.server.gui.add_html(self._render_battery_html(None))
+        # Absolute-positioned HTML overlays for the battery indicators (bottom right
+        # corner, laptop stacked above the robot so they don't overlap).
+        self.battery_html = self.server.gui.add_html(
+            self._render_battery_html(None, self.ROBOT_BATTERY_THRESHOLDS, "🤖", bottom_px=15)
+        )
+        self.laptop_battery_html = self.server.gui.add_html(
+            self._render_battery_html(None, self.LAPTOP_BATTERY_THRESHOLDS, "💻", bottom_px=60)
+        )
+
+        # Absolute-positioned HTML overlay for the Inria logo (bottom left corner)
+        logo_html = self._render_logo_html()
+        if logo_html is not None:
+            self.server.gui.add_html(logo_html)
 
         # Matches orchestrator_node.py's qos_state: current_task/current_state are only
         # published on change, so TRANSIENT_LOCAL is needed here too to get the last value
@@ -185,6 +202,7 @@ class RviserEmergencyNode(Node):
         self.create_subscription(String, '/orchestrator/ui/current_state', self.orchestrator_state_cb, orchestrator_ui_qos)
         self.create_subscription(PathMsg, '/local_plan', self.local_plan_cb, 10)
         self.create_subscription(Float32, self.battery_level_topic, self.battery_level_callback, 10)
+        self.create_subscription(BatteryState, self.laptop_battery_topic, self.laptop_battery_callback, 10)
 
         threading.Thread(target=self.viser_sync_loop, daemon=True).start()
 
@@ -196,6 +214,12 @@ class RviserEmergencyNode(Node):
                 self.show_opensot = param.value
         return SetParametersResult(successful=True)
 
+    # (min percentage, color) pairs, checked highest-first. The robot shuts itself off at
+    # 40%, so its "red" warning kicks in well above where a laptop's would.
+    ROBOT_BATTERY_THRESHOLDS = [(70, "#22c55e"), (50, "#ff9040"), (0, "#ef4444")]
+    # Regular consumer-electronics convention (matches typical OS low-battery warnings).
+    LAPTOP_BATTERY_THRESHOLDS = [(50, "#22c55e"), (20, "#ff9040"), (0, "#ef4444")]
+
     def battery_level_callback(self, msg):
         with self.state_lock:
             val = msg.data
@@ -205,7 +229,23 @@ class RviserEmergencyNode(Node):
             else:
                 self.latest_battery_pct = int(val)
 
-    def _render_battery_html(self, percentage):
+    def laptop_battery_callback(self, msg):
+        with self.state_lock:
+            val = msg.percentage
+            # BatteryState.percentage is nominally 0-1, but accept 0-100 too, same as
+            # the robot's Float32 topic.
+            if 0.0 < val <= 1.0:
+                self.latest_laptop_battery_pct = int(val * 100)
+            else:
+                self.latest_laptop_battery_pct = int(val)
+
+    def _battery_color(self, val, thresholds):
+        for min_pct, color in thresholds:
+            if val >= min_pct:
+                return color
+        return thresholds[-1][1]
+
+    def _render_battery_html(self, percentage, thresholds, icon, bottom_px):
         if percentage is None:
             val = "--"
             width = 0
@@ -213,24 +253,34 @@ class RviserEmergencyNode(Node):
         else:
             val = int(percentage)
             width = max(0, min(100, val))
-            if val >= 70:
-                color = "#22c55e"  # green
-            elif val >= 50:
-                color = "#ff9040"  # orange
-            else:
-                color = "#ef4444"  # red
+            color = self._battery_color(val, thresholds)
 
         return f'''
-        <div style="position: fixed; bottom: 15px; right: 15px; z-index: 9999;
+        <div style="position: fixed; bottom: {bottom_px}px; right: 15px; z-index: 9999;
                     display: flex; align-items: center; gap: 8px;
                     background: rgba(0, 0, 0, 0.6); padding: 8px 12px;
                     border-radius: 8px; color: white; font-family: sans-serif; font-weight: bold; pointer-events: none;">
+            <div style="font-size: 16px; line-height: 1;">{icon}</div>
             <div style="width: 30px; height: 14px; border: 2px solid white; border-radius: 3px; position: relative; padding: 1px;">
                 <div style="width: {width}%; height: 100%; background: {color}; border-radius: 1px; transition: width 0.3s ease;"></div>
                 <div style="position: absolute; right: -4px; top: 3px; width: 2px; height: 6px; background: white; border-radius: 0 2px 2px 0;"></div>
             </div>
             <div style="font-size: 14px; min-width: 40px;">{val}%</div>
         </div>
+        '''
+
+    def _render_logo_html(self):
+        logo_path = self.assets_dir / "Inr_logo_fr_rouge.png"
+        if not logo_path.exists():
+            self.get_logger().warn(f"Logo not found: {logo_path}")
+            return None
+
+        logo_b64 = base64.b64encode(logo_path.read_bytes()).decode("ascii")
+
+        return f'''
+        <img src="data:image/png;base64,{logo_b64}"
+             style="position: fixed; top: 15px; left: 15px; z-index: 9999;
+                    height: 80px; pointer-events: none;" />
         '''
 
     def _toggle_first_person(self):
@@ -368,16 +418,8 @@ class RviserEmergencyNode(Node):
                 position = pose["position"]
                 orientation = pose["orientation"]
 
-                # skip_materials: these scanned OBJs carry thousands of near-duplicate
-                # per-face materials (e.g. 3700+ for the table), which makes trimesh's
-                # material/texture resolution hang or OOM. Same workaround as
-                # FoundationPoseNode/node.py uses for the same mesh set.
-                mesh = trimesh.load(str(mesh_path), force='mesh', process=False, skip_materials=True)
-                # skip_materials drops the (unusable) per-face materials above, so give
-                # the mesh a plain grey look instead of trimesh's default placeholder.
-                mesh.visual = trimesh.visual.ColorVisuals(
-                    mesh=mesh, vertex_colors=[128, 128, 128, 255]
-                )
+
+                mesh = trimesh.load(str(mesh_path), force='mesh', process=False, skip_materials=False)
             except Exception as e:
                 self.get_logger().error(f"Failed to load scene asset '{object_key}': {e}")
                 continue
@@ -469,13 +511,18 @@ class RviserEmergencyNode(Node):
             label = category.upper()
         color = self.ORCHESTRATOR_CATEGORY_COLORS.get(category, "#6b7280")
 
+        # "solevita" is the orchestrator's internal object key for the juice carton
+        # (see pick_place_orchestrator.py: "pick_solevita"/"place_solevita") - show the
+        # friendlier "juice" name instead, without touching the real task name used above.
+        display_task = task_name.replace("solevita", "juice") if task_name else task_name
+
         return f'''
         <div style="background:{color}; color:white; font-weight:600; text-align:center;
                     padding:10px 6px; border-radius:6px; font-family:sans-serif;
                     font-size:14px; letter-spacing:0.5px;">
           {label}
           <div style="font-size:11px; font-weight:400; opacity:0.85; margin-top:2px;">
-            {task_name or "&mdash;"}
+            {display_task or "&mdash;"}
           </div>
         </div>
         '''
@@ -517,6 +564,7 @@ class RviserEmergencyNode(Node):
                     current_marker = self.latest_object_marker
                     current_marker_last_seen = self.marker_last_seen.copy()
                     current_battery = self.latest_battery_pct
+                    current_laptop_battery = self.latest_laptop_battery_pct
 
                     # Copy trajectory data but DO NOT reset self.latest_traj to None
                     current_traj = self.latest_traj.copy()
@@ -760,10 +808,18 @@ class RviserEmergencyNode(Node):
                     with self.state_lock:
                         self.marker_last_seen.pop(path, None)
 
-                # 6. Battery indicator overlay
+                # 6. Battery indicator overlays
                 if current_battery is not None and current_battery != self.last_rendered_battery:
-                    self.battery_html.content = self._render_battery_html(current_battery)
+                    self.battery_html.content = self._render_battery_html(
+                        current_battery, self.ROBOT_BATTERY_THRESHOLDS, "🤖", bottom_px=15
+                    )
                     self.last_rendered_battery = current_battery
+
+                if current_laptop_battery is not None and current_laptop_battery != self.last_rendered_laptop_battery:
+                    self.laptop_battery_html.content = self._render_battery_html(
+                        current_laptop_battery, self.LAPTOP_BATTERY_THRESHOLDS, "💻", bottom_px=60
+                    )
+                    self.last_rendered_laptop_battery = current_laptop_battery
 
             self.server.flush()
             time.sleep(0.033) 
