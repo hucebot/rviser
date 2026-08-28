@@ -26,8 +26,8 @@ TASK_OBJECTS = {
     "place_banana": "the banana",
     "pick_baguette": "the baguette",
     "place_baguette": "the baguette",
-    "pick_apple": "the apple",
-    "place_apple": "the apple",
+    "pick_solevita": "the juice",
+    "place_solevita": "the juice",
 }
 
 # task name prefix/name -> (verb, present participle used for "just finished ...")
