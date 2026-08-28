@@ -72,7 +72,7 @@ class RviserEmergencyNode(Node):
         self.bridge = cv_bridge.CvBridge()
         self.state_lock = threading.Lock()
         
-        self.robot_frame = self.server.scene.add_frame("/robot")
+        self.robot_frame = self.server.scene.add_frame("/robot", show_axes=False)
         self.server.scene.add_grid("/ground_grid", width=20.0, height=20.0, cell_size=0.5)
 
         self.server.initial_camera.position = (2.0, 1.0, 1.5)
@@ -213,7 +213,12 @@ class RviserEmergencyNode(Node):
         else:
             val = int(percentage)
             width = max(0, min(100, val))
-            color = "#22c55e" if val > 45 else "#ef4444"
+            if val >= 70:
+                color = "#22c55e"  # green
+            elif val >= 50:
+                color = "#ff9040"  # orange
+            else:
+                color = "#ef4444"  # red
 
         return f'''
         <div style="position: fixed; bottom: 15px; right: 15px; z-index: 9999;
